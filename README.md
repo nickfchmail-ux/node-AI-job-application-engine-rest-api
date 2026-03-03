@@ -1,4 +1,4 @@
-# AI Job Application App — Backend
+# AI powered Job Application Engine — Backend
 
 Automated job scraper and applicant assistant for Hong Kong job boards (JobsDB, CTgoodjobs).
 
