@@ -26,6 +26,7 @@ Automated job scraper and applicant assistant for Hong Kong job boards (JobsDB, 
 4. `npm start`
 
 
+
 ## Note
-> For expriencing fast development of just 2 days,
-> 95% of the code in this project was written by AI (GitHub Copilot / Claude) with simple and modular guidances
+> For expriencing fast development,
+> 95% of the code in this project was written by AI spending 2 days (GitHub Copilot / Claude) with simple and modular guidances.
