@@ -1,6 +1,3 @@
-## Note
-> ~90% AI-written (Claude 4.6) — because the junior dev job market is rough enough without also hand-writing cover letters. 😂
-
 # AI powered Job Application Engine — rest api
 
 Automated job scraper and applicant assistant for Hong Kong job boards (JobsDB, CTgoodjobs).

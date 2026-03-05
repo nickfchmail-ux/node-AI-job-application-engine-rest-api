@@ -15,8 +15,13 @@ export interface Job {
   description?: string;
 }
 
-
+/**
+ * CSS selector configuration used by the shared DOM extractor.
+ * Each field is an ordered array of selectors tried one by one until a non-empty
+ * text value is found.  `card` is the root element that groups one job listing.
+ */
 export interface DomSelectors {
+  /** One or more selectors for the card root; the first that returns results wins */
   card: string[];
   title: string[];
   company: string[];
@@ -24,17 +29,19 @@ export interface DomSelectors {
   salary?: string[];
   postedDate?: string[];
   description?: string[];
+  /** Selector for the <a> tag inside a card */
   link?: string[];
 }
 
+// ── Abstract base class ───────────────────────────────────────────────────────
 
 export abstract class BaseJobScraper {
-
+  /** Human-readable name shown in output and saved as `source` */
   abstract readonly name: string;
 
-
+  /** Logging function — set by MultiboardScraper so output appears in job status */
   protected log: (msg: string) => void = console.log;
-
+  /** Root URL of the job board, used to resolve relative links */
   abstract readonly baseUrl: string;
 
   /** Build a paginated search URL for the given keyword and page number */
