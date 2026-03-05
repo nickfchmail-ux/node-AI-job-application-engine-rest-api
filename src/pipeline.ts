@@ -764,8 +764,7 @@ async function fetchExistingJobs(
       "url, title, company, location, salary, posted_date, short_description, responsibilities, requirements, benefits, skills, employment_type, experience_level, about_company, raw_description, fit, fit_score, fit_reasons, cover_letter, expected_salary",
     )
     .eq("user_id", userId)
-    .in("url", urls)
-    .not("fit", "is", null);
+    .in("url", urls);
 
   if (error || !data) return new Map();
 
@@ -774,7 +773,6 @@ async function fetchExistingJobs(
     const reasons: string[] = Array.isArray(row.fit_reasons)
       ? (row.fit_reasons as string[])
       : [];
-    if (row.fit === null || reasons.length === 0) continue;
     const job: AnalysedJob = {
       title: row.title as string,
       company: row.company as string,
