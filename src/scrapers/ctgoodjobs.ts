@@ -1,6 +1,6 @@
 import { type Page } from "playwright";
-import { Job } from "../types/types";
-import BaseJobScraper from "./BaseClass";
+import { BaseJobScraper } from "./base";
+import { Job } from "./types";
 
 export class CTgoodjobsScraper extends BaseJobScraper {
   readonly name = "CTgoodjobs HK";
@@ -38,7 +38,13 @@ export class CTgoodjobsScraper extends BaseJobScraper {
 
   protected async extractJobs(page: Page): Promise<Omit<Job, "source">[]> {
     return page.evaluate((baseUrl: string) => {
-      const results: Omit<Job, "source">[] = [];
+      const results: {
+        title: string;
+        company: string;
+        location: string;
+        postedDate?: string;
+        url: string;
+      }[] = [];
 
       const cards = document.querySelectorAll("div.job-card");
       cards.forEach((card) => {
@@ -56,7 +62,6 @@ export class CTgoodjobsScraper extends BaseJobScraper {
           )?.innerText?.trim() ?? "N/A";
 
         // Location: first .jc-info .col-12 contains a pin SVG then the location text node
-        // innerText skips SVG content, so we just get the location string directly
         const locationEl = card.querySelector(
           ".jc-info .col-12",
         ) as HTMLElement | null;

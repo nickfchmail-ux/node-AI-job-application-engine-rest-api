@@ -1,14 +1,13 @@
 import { type Page } from "playwright";
-import { Job } from "../types/types";
-import BaseJobScraper from "./BaseClass";
+import { BaseJobScraper } from "./base";
+import { Job } from "./types";
 
+// Works from residential IPs (Cloudflare passes them).
+// Railway/GCP IPs are blocked by Cloudflare IP reputation — not fixable
+// with browser fingerprinting. Excluded from DEFAULT_BOARDS for Railway.
 export class IndeedScraper extends BaseJobScraper {
   readonly name = "Indeed HK";
   readonly baseUrl = "https://hk.indeed.com";
-
-  // Works from residential IPs (Cloudflare passes them).
-  // Railway/GCP IPs are blocked by Cloudflare IP reputation — not fixable
-  // with browser fingerprinting. Excluded from DEFAULT_BOARDS for Railway.
 
   async scrape(keyword: string, pages = 0): Promise<Job[]> {
     const maxPages = Math.min(pages || this.MAX_PAGES, this.MAX_PAGES);
@@ -33,7 +32,6 @@ export class IndeedScraper extends BaseJobScraper {
           this.log(`[Indeed HK] Page ${p}: ${jobs.length} jobs`);
 
           if (jobs.length === 0) {
-            // Surface what page Indeed actually returned
             const title = await tab.title();
             const bodySnippet = await tab.evaluate(
               () =>

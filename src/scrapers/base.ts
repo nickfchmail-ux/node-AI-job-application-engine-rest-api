@@ -1,7 +1,7 @@
 import { chromium, type Page } from "playwright";
-import { DomSelectors, Job } from "../types/types";
+import { DomSelectors, Job } from "./types";
 
-export default abstract class BaseJobScraper {
+export abstract class BaseJobScraper {
   /** Human-readable name shown in output and saved as `source` */
   abstract readonly name: string;
 
@@ -28,8 +28,7 @@ export default abstract class BaseJobScraper {
   /**
    * Return the total number of result pages available for this search.
    * Called once after page 1 is loaded. Default returns Infinity — the loop
-   * stops naturally when a page returns 0 results. Override to read the real
-   * total from the page so all pages are fetched without an extra empty request.
+   * stops naturally when a page returns 0 results.
    */
   protected async getTotalPages(_page: Page): Promise<number> {
     return Infinity;
@@ -196,7 +195,7 @@ export default abstract class BaseJobScraper {
 
         cards.forEach((card) => {
           const title = pickText(card, sel.title) ?? "N/A";
-          if (title === "N/A") return; // skip empty cards
+          if (title === "N/A") return;
 
           const company = pickText(card, sel.company) ?? "N/A";
           const location = pickText(card, sel.location) ?? "N/A";

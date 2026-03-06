@@ -1,6 +1,6 @@
 import { type Page } from "playwright";
-import { Job } from "../types/types";
-import BaseJobScraper from "./BaseClass";
+import { BaseJobScraper } from "./base";
+import { Job } from "./types";
 
 export class JobsDBScraper extends BaseJobScraper {
   readonly name = "JobsDB HK";
@@ -36,7 +36,15 @@ export class JobsDBScraper extends BaseJobScraper {
   protected async extractJobs(page: Page): Promise<Omit<Job, "source">[]> {
     // Primary: parse embedded Next.js JSON (fast & reliable)
     const fromNextData = await page.evaluate((baseUrl: string) => {
-      const results: Omit<Job, "source">[] = [];
+      const results: {
+        title: string;
+        company: string;
+        location: string;
+        salary?: string;
+        postedDate?: string;
+        description?: string;
+        url: string;
+      }[] = [];
       const el = document.getElementById("__NEXT_DATA__");
       if (!el?.textContent) return results;
       try {
