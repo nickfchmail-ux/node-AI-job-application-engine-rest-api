@@ -140,9 +140,8 @@ async function scrapeDetail(
 
   // ── JobsDB — use Playwright to bypass bot protection ─────────────────────
   if (hostname.includes("jobsdb.com")) {
-    const ctx = browserContext;
-    if (!ctx) return empty;
-    const page = await ctx.newPage();
+    if (!browserContext) return empty;
+    const page = await browserContext.newPage();
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
       await page.waitForSelector("#__NEXT_DATA__", { timeout: 10000 }).catch(() => {});
@@ -170,39 +169,34 @@ async function scrapeDetail(
     return empty;
   }
 
-  let html = "";
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-      signal: AbortSignal.timeout(20000),
-    });
-    html = await res.text();
-  } catch {
-    return empty;
-  }
-
-  // ── CTgoodjobs — extract description block from raw HTML ──────────────────
+  // ── CTgoodjobs — use Playwright so JS-rendered content is available ────────
   if (hostname.includes("ctgoodjobs.hk")) {
-    const idMatch = html.match(/id="jd__desc"[^>]*>([\s\S]*?)<\/div>/i);
-    if (idMatch) {
-      const raw = htmlToText(idMatch[1]);
-      if (raw.length > 50)
-        return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
-    }
-    const blocks = [
-      ...html.matchAll(
-        /<(?:section|article|div)[^>]*class="[^"]*(?:jd|job|desc|content)[^"]*"[^>]*>([\s\S]{200,5000}?)<\/(?:section|article|div)>/gi,
-      ),
-    ];
-    for (const b of blocks) {
-      const raw = htmlToText(b[1]);
-      if (raw.length > 100)
-        return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+    if (!browserContext) return empty;
+    const page = await browserContext.newPage();
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+      await page.waitForSelector("#jd__desc, [class*='jd'], [class*='job-desc']", { timeout: 10000 }).catch(() => {});
+      const html = await page.content();
+      const idMatch = html.match(/id="jd__desc"[^>]*>([\s\S]*?)<\/div>/i);
+      if (idMatch) {
+        const raw = htmlToText(idMatch[1]);
+        if (raw.length > 50)
+          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+      }
+      const blocks = [
+        ...html.matchAll(
+          /<(?:section|article|div)[^>]*class="[^"]*(?:jd|job|desc|content)[^"]*"[^>]*>([\s\S]{200,5000}?)<\/(?:section|article|div)>/gi,
+        ),
+      ];
+      for (const b of blocks) {
+        const raw = htmlToText(b[1]);
+        if (raw.length > 100)
+          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+      }
+    } catch {
+      /* fall through */
+    } finally {
+      await page.close();
     }
     return empty;
   }
@@ -217,18 +211,15 @@ export async function enrichJobs(
   const JOB_TIMEOUT_MS = 25_000;
   const CONCURRENCY = 5;
 
-  // Launch a shared Playwright browser for JobsDB pages (bot-protected)
-  const hasJobsDb = jobs.some((j) => new URL(j.url).hostname.includes("jobsdb.com"));
-  const browser = hasJobsDb ? await chromium.launch({ headless: true }) : null;
-  const browserContext = browser
-    ? await browser.newContext({
-        userAgent:
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        locale: "en-US",
-        viewport: { width: 1280, height: 800 },
-      })
-    : undefined;
+  // Launch a shared Playwright browser for all detail pages
+  const browser = await chromium.launch({ headless: true });
+  const browserContext = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    locale: "en-US",
+    viewport: { width: 1280, height: 800 },
+  });
 
   const results: PromiseSettledResult<JobDetail>[] = Array(jobs.length);
   let nextIdx = 0;
@@ -264,8 +255,8 @@ export async function enrichJobs(
 
   await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 
-  await browserContext?.close();
-  await browser?.close();
+  await browserContext.close();
+  await browser.close();
 
   return jobs.map((job, i) => {
     const r = results[i];
