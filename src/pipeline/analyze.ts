@@ -3,7 +3,7 @@ import { AnalysedJob, EnrichedJob, FitAnalysis } from "./types";
 
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 
-async function analyzeOne(
+export async function analyzeOne(
   resumeText: string,
   job: EnrichedJob,
 ): Promise<FitAnalysis> {

@@ -13,7 +13,10 @@ export function loadEnvLocal(): void {
     if (eqIdx === -1) continue;
     const key = trimmed.slice(0, eqIdx).trim();
     const value = trimmed.slice(eqIdx + 1).trim();
-    if (key && !(key in process.env)) process.env[key] = value;
+    // Always prefer values from .env.local when present — override existing
+    // environment variables to ensure local config (e.g., REDIS_URL) is used
+    // during development and deployments that rely on this file.
+    if (key) process.env[key] = value;
   }
 }
 

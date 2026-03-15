@@ -1,4 +1,5 @@
-import { chromium, type BrowserContext } from "playwright";
+import { type BrowserContext } from "playwright";
+import { browserPool } from "./browserPool";
 import { EnrichedJob, Job, JobDetail } from "./types";
 
 function toLines(text: string): string[] {
@@ -187,8 +188,9 @@ async function scrapeDetailPlaywright(
     const page = await browserContext.newPage();
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
-      await page
-        .waitForSelector('[data-automation="jobAdDetails"]', { timeout: 12000 });
+      await page.waitForSelector('[data-automation="jobAdDetails"]', {
+        timeout: 12000,
+      });
       const text = await page.evaluate(() => {
         const el = document.querySelector('[data-automation="jobAdDetails"]');
         return el ? (el as HTMLElement).innerText : null;
@@ -250,13 +252,62 @@ async function scrapeDetailPlaywright(
   return { ...EMPTY_DETAIL };
 }
 
+/**
+ * Enrich a single job listing (fetch first, then Playwright fallback).
+ * Used by per-job workers so each listing is processed independently.
+ */
+export async function enrichOneJob(
+  job: Job,
+  log: (msg: string) => void = console.log,
+): Promise<EnrichedJob> {
+  const FETCH_TIMEOUT_MS = 15_000;
+  const PW_TIMEOUT_MS = 25_000;
+
+  // Phase 1: try plain fetch
+  let detail: JobDetail | null = null;
+  try {
+    detail = await Promise.race([
+      scrapeDetailFetch(job.url),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("fetch timeout")), FETCH_TIMEOUT_MS),
+      ),
+    ]);
+  } catch {
+    /* fall through to Playwright */
+  }
+
+  // Phase 2: Playwright fallback
+  if (!detail) {
+    const browserContext = await browserPool.acquire();
+    try {
+      detail = await Promise.race([
+        scrapeDetailPlaywright(job.url, browserContext),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("pw timeout")), PW_TIMEOUT_MS),
+        ),
+      ]);
+    } catch {
+      detail = { ...EMPTY_DETAIL };
+    } finally {
+      await browserPool.release(browserContext);
+    }
+  }
+
+  log(
+    `Enriched: ${job.title} @ ${job.company} | ${detail.responsibilities.length} resp | ${detail.requirements.length} req`,
+  );
+  return { ...job, jobDetail: detail };
+}
+
 export async function enrichJobs(
   jobs: Job[],
   log: (msg: string) => void = console.log,
 ): Promise<EnrichedJob[]> {
   const FETCH_TIMEOUT_MS = 15_000;
   const PW_TIMEOUT_MS = 25_000;
-  const PW_CONCURRENCY = 5;
+  // 1 concurrent Playwright page on Railway free tier (512 MB).
+  // Raise to 3-5 on a 2 GB+ container.
+  const PW_CONCURRENCY = Number(process.env.PW_CONCURRENCY ?? 1);
 
   // ── Phase 1: fetch all jobs simultaneously ────────────────────────────────
   log(`⚡ Phase 1: fetching ${jobs.length} job(s) via HTTP in parallel...`);
@@ -300,14 +351,7 @@ export async function enrichJobs(
     log(
       `🎭 Phase 2: launching Playwright for ${playwrightIndices.length} job(s)...`,
     );
-    const browser = await chromium.launch({ headless: true });
-    const browserContext = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      locale: "en-US",
-      viewport: { width: 1280, height: 800 },
-    });
+    const browserContext = await browserPool.acquire();
 
     let nextPwIdx = 0;
 
@@ -342,8 +386,7 @@ export async function enrichJobs(
     }
 
     await Promise.all(Array.from({ length: PW_CONCURRENCY }, () => pwWorker()));
-    await browserContext.close();
-    await browser.close();
+    await browserPool.release(browserContext);
   }
 
   return jobs.map((job, i) => ({

@@ -19,7 +19,9 @@ export class MultiboardScraper {
   }
 
   /**
-   * Scrape all boards in parallel and combine results.
+   * Scrape all boards sequentially and combine results.
+   * Sequential (not parallel) to keep peak memory low in constrained containers —
+   * each board acquires a browser context, scrapes, then releases before the next starts.
    * Failed boards are skipped with a warning — they won't crash the run.
    */
   async scrape(
@@ -32,16 +34,13 @@ export class MultiboardScraper {
       (s as any).log = log;
     }
 
-    const settled = await Promise.allSettled(
-      this.scrapers.map((s) => s.scrape(keyword, pages)),
-    );
-
     const jobs: Job[] = [];
-    for (const result of settled) {
-      if (result.status === "fulfilled") {
-        jobs.push(...result.value);
-      } else {
-        log(`[MultiboardScraper] A board failed: ${result.reason}`);
+    for (const scraper of this.scrapers) {
+      try {
+        const results = await scraper.scrape(keyword, pages);
+        jobs.push(...results);
+      } catch (err) {
+        log(`[MultiboardScraper] A board failed: ${err}`);
       }
     }
     return jobs;

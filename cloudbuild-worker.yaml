@@ -1,0 +1,6 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-f', 'Dockerfile.worker', '-t', 'gcr.io/$PROJECT_ID/worker:latest', '.']
+timeout: '1200s'
+images:
+  - 'gcr.io/$PROJECT_ID/worker:latest'

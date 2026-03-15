@@ -1,4 +1,5 @@
 import { type Page } from "playwright";
+import { browserPool } from "../pipeline/browserPool";
 import { BaseJobScraper } from "./base";
 import { Job } from "./types";
 
@@ -11,7 +12,7 @@ export class IndeedScraper extends BaseJobScraper {
 
   async scrape(keyword: string, pages = 0): Promise<Job[]> {
     const maxPages = Math.min(pages || this.MAX_PAGES, this.MAX_PAGES);
-    const { browser, context } = await this.createContext();
+    const context = await browserPool.acquire();
     const allJobs: Job[] = [];
 
     try {
@@ -50,7 +51,7 @@ export class IndeedScraper extends BaseJobScraper {
         }
       }
     } finally {
-      await browser.close();
+      await browserPool.release(context);
     }
 
     return allJobs;

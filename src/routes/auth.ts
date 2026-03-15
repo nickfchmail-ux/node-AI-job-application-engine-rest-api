@@ -1,4 +1,4 @@
-import { Router, Request, Response } from "express";
+import { Request, Response, Router } from "express";
 import { getAnonSupabaseClient, getSupabaseClient } from "../db";
 
 const router = Router();

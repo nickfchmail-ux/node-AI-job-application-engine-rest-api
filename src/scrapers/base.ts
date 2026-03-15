@@ -1,5 +1,16 @@
-import { chromium, type Page } from "playwright";
+import { type Page } from "playwright";
+import { browserPool } from "../pipeline/browserPool";
 import { DomSelectors, Job } from "./types";
+
+// Configurable timeouts / retries (ms or counts) via env vars for cloud tuning
+const NAV_TIMEOUT = Number(process.env.SCRAPER_NAV_TIMEOUT_MS ?? 30000);
+const SELECTOR_TIMEOUT = Number(
+  process.env.SCRAPER_SELECTOR_TIMEOUT_MS ?? 20000,
+);
+const SCRAPER_RETRIES = Number(process.env.SCRAPER_RETRIES ?? 1); // extra attempts after first
+const FAILURE_SNIPPET_SIZE = Number(
+  process.env.SCRAPER_FAILURE_SNIPPET_SIZE ?? 2000,
+);
 
 export abstract class BaseJobScraper {
   /** Human-readable name shown in output and saved as `source` */
@@ -37,20 +48,6 @@ export abstract class BaseJobScraper {
   /** Hard cap — never fetch more than this many pages in one run */
   protected readonly MAX_PAGES = 5;
 
-  // ── Shared browser setup ──────────────────────────────────────────────────
-
-  protected async createContext() {
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      locale: "en-US",
-      viewport: { width: 1280, height: 800 },
-    });
-    return { browser, context };
-  }
-
   // ── Shared scrape loop ────────────────────────────────────────────────────
 
   /**
@@ -59,7 +56,7 @@ export abstract class BaseJobScraper {
    *                 ALL available pages (capped at MAX_PAGES).
    */
   async scrape(keyword: string, pages = 0): Promise<Job[]> {
-    const { browser, context } = await this.createContext();
+    const context = await browserPool.acquire();
     const autoMode = pages === 0;
 
     try {
@@ -102,15 +99,58 @@ export abstract class BaseJobScraper {
         const tab = await context.newPage();
         try {
           console.log(`[${this.name}] Fetching page ${p}/${totalPages}`);
-          await tab.goto(this.buildUrl(keyword, p), {
-            waitUntil: "domcontentloaded",
-            timeout: 30000,
-          });
-          await tab
-            .waitForSelector(this.getWaitSelector(), { timeout: 20000 })
-            .catch(() => {});
-          await tab.waitForTimeout(2000);
-          return await this.extractJobs(tab);
+
+          let lastErr: any = null;
+          // Attempt initial + SCRAPER_RETRIES retries
+          for (let attempt = 1; attempt <= SCRAPER_RETRIES + 1; attempt++) {
+            try {
+              const resp = await tab.goto(this.buildUrl(keyword, p), {
+                waitUntil: "domcontentloaded",
+                timeout: NAV_TIMEOUT,
+              });
+              await tab
+                .waitForSelector(this.getWaitSelector(), {
+                  timeout: SELECTOR_TIMEOUT,
+                })
+                .catch(() => {});
+              await tab.waitForTimeout(2000);
+              // Small success log with response status when available
+              if (resp && typeof (resp as any).status === "function") {
+                console.log(
+                  `[${this.name}] Page ${p} response: ${(resp as any).status()}`,
+                );
+              }
+              return await this.extractJobs(tab);
+            } catch (err) {
+              lastErr = err;
+              console.warn(
+                `[${this.name}] Page ${p} attempt ${attempt} failed: ${err}`,
+              );
+              if (attempt <= SCRAPER_RETRIES) {
+                // Backoff before retrying
+                const backoff = 1000 * attempt;
+                await tab.waitForTimeout(backoff);
+                continue;
+              }
+              // Final failure — capture a small HTML snippet for diagnostics
+              try {
+                const html = await tab.content();
+                const snippet = html.slice(0, FAILURE_SNIPPET_SIZE);
+                console.error(
+                  `[${this.name}] Final failure on page ${p}: ${String(
+                    lastErr,
+                  )}. HTML snippet:\n${snippet}`,
+                );
+              } catch (e) {
+                console.error(
+                  `[${this.name}] Failed to capture page content: ${e}`,
+                );
+              }
+              throw lastErr;
+            }
+          }
+          // unreachable, but satisfy TS
+          throw lastErr;
         } finally {
           await tab.close();
         }
@@ -145,7 +185,7 @@ export abstract class BaseJobScraper {
 
       return allJobs;
     } finally {
-      await browser.close();
+      await browserPool.release(context);
     }
   }
 

@@ -16,4 +16,8 @@ COPY . .
 # Expose port (Railway sets $PORT automatically)
 EXPOSE 3000
 
-CMD ["npx", "ts-node", "src/server.ts"]
+# Runs HTTP API server + pipeline worker in the same container.
+# Both share the browser pool (browserPool.ts) and connect to the same Redis.
+# To scale workers independently, deploy a second Railway service from this
+# image with CMD ["npx", "ts-node", "src/worker.ts"] and no EXPOSE.
+CMD ["npm", "run", "start:all"]

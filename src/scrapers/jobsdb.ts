@@ -7,7 +7,12 @@ export class JobsDBScraper extends BaseJobScraper {
   readonly baseUrl = "https://hk.jobsdb.com";
 
   protected buildUrl(keyword: string, page: number): string {
-    return `${this.baseUrl}/jobs/in-hong-kong?keywords=${encodeURIComponent(keyword.trim())}&page=${page}`;
+    const clean = keyword.trim().toLowerCase();
+    const slug = clean.replace(/[^a-z0-9\s-]+/g, "").replace(/\s+/g, "-");
+    // New JobsDB path format: /{slug}-jobs/in-hong-kong
+    // Fallback to query param form if slug is empty
+    if (slug) return `${this.baseUrl}/${slug}-jobs/in-hong-kong?page=${page}`;
+    return `${this.baseUrl}/${encodeURIComponent(keyword.trim())}-jobs/in-hong-kong?page=${page}`;
   }
 
   protected getWaitSelector(): string {
