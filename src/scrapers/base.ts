@@ -17,7 +17,7 @@ export abstract class BaseJobScraper {
   abstract readonly name: string;
 
   /** Logging function — set by MultiboardScraper so output appears in job status */
-  protected log: (msg: string) => void = console.log;
+  log: (msg: string) => void = console.log;
   /** Root URL of the job board, used to resolve relative links */
   abstract readonly baseUrl: string;
 
@@ -48,6 +48,16 @@ export abstract class BaseJobScraper {
   /** Hard cap — never fetch more than this many pages in one run */
   protected readonly MAX_PAGES = 5;
 
+  /** Wait strategy for initial page load. Subclasses can override for JS-heavy sites. */
+  protected getWaitUntil(): "domcontentloaded" | "networkidle" | "load" {
+    return "domcontentloaded";
+  }
+
+  /** Extra delay (ms) after selector wait. Subclasses can override for slow-rendering sites. */
+  protected getExtraDelay(): number {
+    return 2000;
+  }
+
   // ── Shared scrape loop ────────────────────────────────────────────────────
 
   /**
@@ -63,15 +73,15 @@ export abstract class BaseJobScraper {
       // ── Step 1: fetch page 1 to warm up and detect total pages ─────────────
       const firstPage = await context.newPage();
       await firstPage.goto(this.buildUrl(keyword, 1), {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
+        waitUntil: this.getWaitUntil(),
+        timeout: NAV_TIMEOUT,
       });
       await firstPage
-        .waitForSelector(this.getWaitSelector(), { timeout: 20000 })
+        .waitForSelector(this.getWaitSelector(), { timeout: SELECTOR_TIMEOUT })
         .catch(() =>
           console.warn(`[${this.name}] Selector timeout — continuing anyway`),
         );
-      await firstPage.waitForTimeout(2000);
+      await firstPage.waitForTimeout(this.getExtraDelay());
 
       const totalPages = autoMode
         ? Math.min(await this.getTotalPages(firstPage), this.MAX_PAGES)
@@ -82,12 +92,24 @@ export abstract class BaseJobScraper {
       );
 
       const firstRaw = await this.extractJobs(firstPage);
-      await firstPage.close();
 
       if (firstRaw.length === 0) {
-        console.warn(`[${this.name}] No jobs found on page 1. Stopping.`);
+        // Capture HTML snippet for diagnostics when a board returns nothing
+        try {
+          const snippet = await firstPage.content();
+          const title = await firstPage.title();
+          const url = firstPage.url();
+          console.warn(
+            `[${this.name}] No jobs found on page 1. URL: ${url}, Title: "${title}", HTML (first 1500 chars):\n${snippet.slice(0, 1500)}`,
+          );
+          this.log(
+            `[${this.name}] 0 jobs on page 1 — possible anti-bot or layout change. Page title: "${title}"`,
+          );
+        } catch (_) {}
+        await firstPage.close();
         return [];
       }
+      await firstPage.close();
 
       // ── Step 2: fetch all remaining pages in parallel ──────────────────────
       const remainingPageNums = Array.from(

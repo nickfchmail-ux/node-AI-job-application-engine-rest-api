@@ -1,20 +1,19 @@
-import { BaseJobScraper } from "./base";
 import { CTgoodjobsScraper } from "./ctgoodjobs";
 import { IndeedScraper } from "./indeed";
 import { JobsDBScraper } from "./jobsdb";
-import { Job } from "./types";
+import { Job, JobScraper } from "./types";
 
 /** Map of available board keys to their scraper constructors */
-export const BOARD_MAP: Record<string, () => BaseJobScraper> = {
+export const BOARD_MAP: Record<string, () => JobScraper> = {
   jobsdb: () => new JobsDBScraper(),
   indeed: () => new IndeedScraper(),
   ctgoodjobs: () => new CTgoodjobsScraper(),
 };
 
 export class MultiboardScraper {
-  private scrapers: BaseJobScraper[];
+  private scrapers: JobScraper[];
 
-  constructor(scrapers: BaseJobScraper[]) {
+  constructor(scrapers: JobScraper[]) {
     this.scrapers = scrapers;
   }
 
@@ -31,16 +30,17 @@ export class MultiboardScraper {
   ): Promise<Job[]> {
     // Inject log into every scraper so diagnostics surface in job-status polls
     for (const s of this.scrapers) {
-      (s as any).log = log;
+      s.log = log;
     }
 
     const jobs: Job[] = [];
     for (const scraper of this.scrapers) {
       try {
         const results = await scraper.scrape(keyword, pages);
+        log(`[${scraper.name}] returned ${results.length} job(s)`);
         jobs.push(...results);
       } catch (err) {
-        log(`[MultiboardScraper] A board failed: ${err}`);
+        log(`[MultiboardScraper] ${scraper.name} failed: ${err}`);
       }
     }
     return jobs;

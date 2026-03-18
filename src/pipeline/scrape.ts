@@ -1,10 +1,11 @@
 import {
   CTgoodjobsScraper,
   IndeedScraper,
+  Job,
+  JobScraper,
   JobsDBScraper,
   MultiboardScraper,
 } from "../scrapers";
-import { Job } from "./types";
 
 /**
  * Convert relative date strings from job boards into ISO date strings (YYYY-MM-DD).
@@ -41,14 +42,10 @@ function parseRelativeDate(raw: string | undefined): string | undefined {
 const ALL_BOARDS = ["jobsdb", "indeed", "ctgoodjobs"] as const;
 type BoardKey = (typeof ALL_BOARDS)[number];
 
-// Indeed uses Cloudflare Bot Management which blocks cloud/datacenter IPs.
-// Default boards exclude Indeed for Railway; pass boards=["indeed"] to opt in.
-export const DEFAULT_BOARDS: BoardKey[] = ["jobsdb", "ctgoodjobs"];
+// Indeed now works on Railway via ScraperAPI proxy (requires SCRAPERAPI_KEY env var).
+export const DEFAULT_BOARDS: BoardKey[] = ["jobsdb", "ctgoodjobs", "indeed"];
 
-const BOARD_FACTORIES: Record<
-  BoardKey,
-  () => JobsDBScraper | IndeedScraper | CTgoodjobsScraper
-> = {
+const BOARD_FACTORIES: Record<BoardKey, () => JobScraper> = {
   jobsdb: () => new JobsDBScraper(),
   indeed: () => new IndeedScraper(),
   ctgoodjobs: () => new CTgoodjobsScraper(),
@@ -59,6 +56,7 @@ export async function scrapeJobs(
   pages = 1,
   log: (msg: string) => void = console.log,
   boards: string[] = [...DEFAULT_BOARDS],
+  countryCode?: string,
 ): Promise<Job[]> {
   const validBoards = boards.filter((b): b is BoardKey => b in BOARD_FACTORIES);
   if (validBoards.length === 0) throw new Error("No valid boards specified.");
@@ -67,6 +65,13 @@ export async function scrapeJobs(
   log(
     `Boards: ${scrapers.map((s) => s.name).join(", ")} — running in parallel`,
   );
+
+  // Pass country code to scrapers that support geotargeting (e.g. Indeed via ScraperAPI)
+  for (const s of scrapers) {
+    if (s instanceof IndeedScraper && countryCode) {
+      s.countryCode = countryCode;
+    }
+  }
 
   const multi = new MultiboardScraper(scrapers);
   const jobs = await multi.scrape(keyword, pages, log);

@@ -9,12 +9,29 @@ const LAUNCH_ARGS = [
   "--disable-gpu",
 ];
 
+// Rotate among realistic Chrome UAs so requests from the same IP look varied
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+];
+
+function randomUA(): string {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
 const CONTEXT_OPTIONS = {
-  userAgent:
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  userAgent: randomUA(),
   locale: "en-US",
   viewport: { width: 1280, height: 800 } as const,
+  // Extra headers to look like a real browser
+  extraHTTPHeaders: {
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+  },
 };
 
 /**
@@ -122,7 +139,13 @@ class BrowserPool {
     }
     this.active++;
     const browser = await this.getBrowser();
-    return browser.newContext(CONTEXT_OPTIONS);
+    // Randomise UA per context so concurrent workers look different
+    const ctx = await browser.newContext({ ...CONTEXT_OPTIONS, userAgent: randomUA() });
+    // Remove navigator.webdriver flag that bot-detection scripts look for
+    await ctx.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    });
+    return ctx;
   }
 
   /** Close the context and hand the slot to the next waiter (if any). */

@@ -118,6 +118,45 @@ function htmlToText(html: string): string {
     .trim();
 }
 
+/**
+ * Extract the innerHTML of a div by its id, properly handling nested divs.
+ * Returns null if the element is not found.
+ */
+function extractDivById(html: string, id: string): string | null {
+  const openPattern = new RegExp(
+    `<div[^>]+id=["']${id}["'][^>]*>`,
+    "i",
+  );
+  const openMatch = openPattern.exec(html);
+  if (!openMatch) return null;
+
+  let depth = 1;
+  let pos = openMatch.index + openMatch[0].length;
+  const openTag = /<div[\s>]/gi;
+  const closeTag = /<\/div>/gi;
+
+  while (depth > 0 && pos < html.length) {
+    openTag.lastIndex = pos;
+    closeTag.lastIndex = pos;
+    const nextOpen = openTag.exec(html);
+    const nextClose = closeTag.exec(html);
+
+    if (!nextClose) break; // malformed HTML
+
+    if (nextOpen && nextOpen.index < nextClose.index) {
+      depth++;
+      pos = nextOpen.index + nextOpen[0].length;
+    } else {
+      depth--;
+      if (depth === 0) {
+        return html.slice(openMatch.index + openMatch[0].length, nextClose.index);
+      }
+      pos = nextClose.index + nextClose[0].length;
+    }
+  }
+  return null;
+}
+
 const FETCH_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -144,13 +183,49 @@ const PLAYWRIGHT_ONLY_HOSTS = ["jobsdb.com", "ctgoodjobs.hk", "indeed.com"];
 async function scrapeDetailFetch(url: string): Promise<JobDetail | null> {
   const hostname = new URL(url).hostname;
 
-  // Indeed is Cloudflare-blocked on Railway — return immediately
-  if (hostname.includes("indeed.com"))
-    return {
-      ...EMPTY_DETAIL,
-      rawDescription:
-        "[Skipped — Indeed detail pages blocked by Cloudflare on Railway]",
-    };
+  // Indeed detail pages: use ScraperAPI if available, otherwise skip (Cloudflare-blocked)
+  if (hostname.includes("indeed.com")) {
+    const apiKey = process.env.SCRAPERAPI_KEY;
+    if (!apiKey) {
+      return {
+        ...EMPTY_DETAIL,
+        rawDescription:
+          "[Skipped — Indeed detail pages blocked by Cloudflare; set SCRAPERAPI_KEY]",
+      };
+    }
+    try {
+      const apiUrl = `http://api.scraperapi.com?api_key=${encodeURIComponent(apiKey)}&url=${encodeURIComponent(url)}`;
+      const res = await fetch(apiUrl, {
+        headers: FETCH_HEADERS,
+        signal: AbortSignal.timeout(60000),
+      });
+      if (!res.ok) return { ...EMPTY_DETAIL };
+      const html = await res.text();
+      // Indeed embeds the full description in #jobDescriptionText (nested divs)
+      const descHtml = extractDivById(html, "jobDescriptionText");
+      if (descHtml) {
+        const raw = htmlToText(descHtml);
+        if (raw.length > 50) {
+          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+        }
+      }
+      // Fallback: try broader content selectors
+      const blocks = [
+        ...html.matchAll(
+          /<(?:section|article|div)[^>]*class="[^"]*(?:job|desc|content|detail)[^"]*"[^>]*>([\s\S]{200,5000}?)<\/(?:section|article|div)>/gi,
+        ),
+      ];
+      for (const b of blocks) {
+        const raw = htmlToText(b[1]);
+        if (raw.length > 100) {
+          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+        }
+      }
+      return { ...EMPTY_DETAIL };
+    } catch {
+      return { ...EMPTY_DETAIL };
+    }
+  }
 
   // JobsDB and CTgoodjobs require a real browser — skip fetch, go straight to Playwright
   if (PLAYWRIGHT_ONLY_HOSTS.some((h) => hostname.includes(h))) return null;
@@ -214,32 +289,26 @@ async function scrapeDetailPlaywright(
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
       await page
-        .waitForSelector("#jd__desc, [class*='jd'], [class*='job-desc']", {
+        .waitForSelector("#jd__desc", {
           timeout: 10000,
         })
         .catch(() => {});
-      const html = await page.content();
-      const idMatch = html.match(/id="jd__desc"[^>]*>([\s\S]*?)<\/div>/i);
-      if (idMatch) {
-        const raw = htmlToText(idMatch[1]);
-        if (raw.length > 50)
-          return {
-            ...parseDescription(raw),
-            rawDescription: raw.slice(0, 3000),
-          };
-      }
-      const blocks = [
-        ...html.matchAll(
-          /<(?:section|article|div)[^>]*class="[^"]*(?:jd|job|desc|content)[^"]*"[^>]*>([\s\S]{200,5000}?)<\/(?:section|article|div)>/gi,
-        ),
-      ];
-      for (const b of blocks) {
-        const raw = htmlToText(b[1]);
-        if (raw.length > 100)
-          return {
-            ...parseDescription(raw),
-            rawDescription: raw.slice(0, 3000),
-          };
+      const raw = await page.evaluate(() => {
+        const el = document.querySelector("#jd__desc") as HTMLElement | null;
+        if (el?.innerText && el.innerText.length > 50) return el.innerText;
+        // Fallback: try broader selectors
+        const fallbacks = [".jd__desc", "[class*='jd__desc']", ".jd__content"];
+        for (const sel of fallbacks) {
+          const fb = document.querySelector(sel) as HTMLElement | null;
+          if (fb?.innerText && fb.innerText.length > 50) return fb.innerText;
+        }
+        return "";
+      });
+      if (raw && raw.length > 50) {
+        return {
+          ...parseDescription(raw),
+          rawDescription: raw.slice(0, 3000),
+        };
       }
     } catch {
       /* fall through */
@@ -260,7 +329,22 @@ export async function enrichOneJob(
   job: Job,
   log: (msg: string) => void = console.log,
 ): Promise<EnrichedJob> {
-  const FETCH_TIMEOUT_MS = 15_000;
+  // Fast path: use pre-fetched description from Indeed batch API (0 ScraperAPI credits)
+  if (job.rawDetailHtml) {
+    const raw = htmlToText(job.rawDetailHtml);
+    if (raw.length > 50) {
+      const detail: JobDetail = {
+        ...parseDescription(raw),
+        rawDescription: raw.slice(0, 3000),
+      };
+      log(
+        `Enriched (batch): ${job.title} @ ${job.company} | ${detail.responsibilities.length} resp | ${detail.requirements.length} req`,
+      );
+      return { ...job, jobDetail: detail };
+    }
+  }
+
+  const FETCH_TIMEOUT_MS = 65_000; // ScraperAPI can take up to 60s
   const PW_TIMEOUT_MS = 25_000;
 
   // Phase 1: try plain fetch
@@ -303,7 +387,7 @@ export async function enrichJobs(
   jobs: Job[],
   log: (msg: string) => void = console.log,
 ): Promise<EnrichedJob[]> {
-  const FETCH_TIMEOUT_MS = 15_000;
+  const FETCH_TIMEOUT_MS = 65_000; // ScraperAPI can take up to 60s
   const PW_TIMEOUT_MS = 25_000;
   // 1 concurrent Playwright page on Railway free tier (512 MB).
   // Raise to 3-5 on a 2 GB+ container.

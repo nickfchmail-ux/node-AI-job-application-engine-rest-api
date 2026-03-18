@@ -1,6 +1,6 @@
 import { Queue } from "bullmq";
-import { redisConnection } from "./redis";
 import type { Job as ScrapedJob } from "../pipeline/types";
+import { redisConnection } from "./redis";
 
 // ── Job data types (discriminated union) ────────────────────────────────────
 
@@ -12,6 +12,7 @@ export interface ScrapeJobData {
   force: boolean;
   boards?: string[];
   userId: string;
+  countryCode?: string;
 }
 
 /** Phase 2 – enrich + analyse + persist ONE listing */

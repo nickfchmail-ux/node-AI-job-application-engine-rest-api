@@ -48,11 +48,13 @@ router.post("/scrape", requireAuth, async (req: Request, res: Response) => {
     pages = 1,
     force = false,
     boards,
+    country_code,
   } = req.body as {
     keyword?: string;
     pages?: number;
     force?: boolean;
     boards?: string[];
+    country_code?: string;
   };
 
   if (!keyword || typeof keyword !== "string" || !keyword.trim()) {
@@ -67,6 +69,8 @@ router.post("/scrape", requireAuth, async (req: Request, res: Response) => {
     force: Boolean(force),
     boards: Array.isArray(boards) ? boards : undefined,
     userId: req.userId!,
+    countryCode:
+      typeof country_code === "string" ? country_code.slice(0, 5) : undefined,
   });
 
   res.status(202).json({ jobId: job.id, pollUrl: `/jobs/${job.id}` });

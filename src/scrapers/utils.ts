@@ -1,8 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
-import { BaseJobScraper } from "./base";
 import { BOARD_MAP, MultiboardScraper } from "./multiboard";
-import { Job } from "./types";
+import { Job, JobScraper } from "./types";
 
 export function printJobs(jobs: Job[], keyword: string): void {
   if (jobs.length === 0) {
@@ -76,7 +75,7 @@ async function main(): Promise<void> {
   const boardArg = process.argv[4] ?? "jobsdb,indeed,ctgoodjobs";
   const boardKeys = boardArg.split(",").map((b) => b.trim().toLowerCase());
 
-  const scrapers: BaseJobScraper[] = [];
+  const scrapers: JobScraper[] = [];
   for (const key of boardKeys) {
     if (BOARD_MAP[key]) {
       scrapers.push(BOARD_MAP[key]());

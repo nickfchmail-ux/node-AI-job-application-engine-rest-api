@@ -16,6 +16,7 @@ import {
   ScrapeResult,
 } from "./queue";
 import { redisConnection } from "./queue/redis";
+import { fetchIndeedBatchDescriptions } from "./scrapers/indeed";
 
 loadEnvLocal();
 
@@ -61,7 +62,7 @@ const STALLED_INTERVAL_MS = 5 * 60 * 1000;
 
 // ── Phase 1 handler: scrape → fan-out child jobs ──────────────────────────
 async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> {
-  const { keyword, pages, force, boards, userId } = job.data;
+  const { keyword, pages, force, boards, userId, countryCode } = job.data;
   const log = (msg: string) => {
     console.log(`[job ${job.id}]`, msg);
     job.log(msg).catch(() => {});
@@ -82,7 +83,13 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
   log(
     `── Scraping "${cleanKeyword}" (${pages} page(s)) on [${boardList.join(", ")}] ──`,
   );
-  const rawJobs = await scrapeJobs(cleanKeyword, pages, log, boardList);
+  const rawJobs = await scrapeJobs(
+    cleanKeyword,
+    pages,
+    log,
+    boardList,
+    countryCode,
+  );
 
   // Deduplicate by URL
   const seenUrls = new Set<string>();
@@ -124,7 +131,32 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
     return { childJobIds: [], totalJobs: 0, keyword: safeKeyword, scrapedDate };
   }
 
-  // 3. Fan-out: create one "process-job" per listing
+  // 3. Batch-fetch Indeed descriptions (saves ~5 ScraperAPI credits per job)
+  const indeedJobs = newJobs.filter((j) => j.url.includes("indeed.com/viewjob"));
+  if (indeedJobs.length > 0) {
+    log(`⚡ Batch-fetching ${indeedJobs.length} Indeed description(s) via RPC endpoint...`);
+    const jobkeyMap = new Map<string, ScrapedJob>();
+    for (const j of indeedJobs) {
+      const match = j.url.match(/[?&]jk=([a-f0-9]+)/i);
+      if (match) jobkeyMap.set(match[1], j);
+    }
+    try {
+      const descriptions = await fetchIndeedBatchDescriptions([...jobkeyMap.keys()], log);
+      let attached = 0;
+      for (const [key, html] of Object.entries(descriptions)) {
+        const job = jobkeyMap.get(key);
+        if (job && html) {
+          job.rawDetailHtml = html;
+          attached++;
+        }
+      }
+      log(`✅ Pre-fetched ${attached}/${indeedJobs.length} Indeed description(s) — saving ~${attached * 5} ScraperAPI credits.`);
+    } catch (err) {
+      log(`⚠ Indeed batch fetch failed (will fallback to ScraperAPI): ${err}`);
+    }
+  }
+
+  // 4. Fan-out: create one "process-job" per listing
   log(`Dispatching ${newJobs.length} individual processing jobs...`);
   const childJobIds: string[] = [];
   for (const scrapedJob of newJobs) {
