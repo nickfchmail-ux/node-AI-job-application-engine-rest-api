@@ -63,7 +63,9 @@ const LOCK_DURATION_MS = 10 * 60 * 1000;
 const STALLED_INTERVAL_MS = 5 * 60 * 1000;
 
 // ── Phase 1 handler: scrape → fan-out child jobs ──────────────────────────
-async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> {
+async function processScrapeJob(
+  job: Job<ScrapeJobData>,
+): Promise<ScrapeResult> {
   const { keyword, pages, force, boards, userId, countryCode } = job.data;
   const log = (msg: string) => {
     console.log(`[job ${job.id}]`, msg);
@@ -103,7 +105,8 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
   log(
     `Scraped ${uniqueJobs.length} jobs (${rawJobs.length - uniqueJobs.length} duplicates removed).`,
   );
-  if (uniqueJobs.length === 0) throw new Error("No jobs found for this keyword.");
+  if (uniqueJobs.length === 0)
+    throw new Error("No jobs found for this keyword.");
 
   // Filter out already-processed jobs
   let newJobs: ScrapedJob[] = uniqueJobs;
@@ -116,9 +119,7 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
       query = query.is("user_id", null);
     }
     const { data } = await query;
-    const existing = new Set(
-      (data ?? []).map((r: { url: string }) => r.url),
-    );
+    const existing = new Set((data ?? []).map((r: { url: string }) => r.url));
     const skipped = uniqueJobs.filter((j) => existing.has(j.url));
     newJobs = uniqueJobs.filter((j) => !existing.has(j.url));
     if (skipped.length > 0)
@@ -131,16 +132,23 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
   }
 
   // 3. Batch-fetch Indeed descriptions (saves ~5 ScraperAPI credits per job)
-  const indeedJobs = newJobs.filter((j) => j.url.includes("indeed.com/viewjob"));
+  const indeedJobs = newJobs.filter((j) =>
+    j.url.includes("indeed.com/viewjob"),
+  );
   if (indeedJobs.length > 0) {
-    log(`⚡ Batch-fetching ${indeedJobs.length} Indeed description(s) via RPC endpoint...`);
+    log(
+      `⚡ Batch-fetching ${indeedJobs.length} Indeed description(s) via RPC endpoint...`,
+    );
     const jobkeyMap = new Map<string, ScrapedJob>();
     for (const j of indeedJobs) {
       const match = j.url.match(/[?&]jk=([a-f0-9]+)/i);
       if (match) jobkeyMap.set(match[1], j);
     }
     try {
-      const descriptions = await fetchIndeedBatchDescriptions([...jobkeyMap.keys()], log);
+      const descriptions = await fetchIndeedBatchDescriptions(
+        [...jobkeyMap.keys()],
+        log,
+      );
       let attached = 0;
       for (const [key, html] of Object.entries(descriptions)) {
         const job = jobkeyMap.get(key);
@@ -149,23 +157,32 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
           attached++;
         }
       }
-      log(`✅ Pre-fetched ${attached}/${indeedJobs.length} Indeed description(s) — saving ~${attached * 5} ScraperAPI credits.`);
+      log(
+        `✅ Pre-fetched ${attached}/${indeedJobs.length} Indeed description(s) — saving ~${attached * 5} ScraperAPI credits.`,
+      );
     } catch (err) {
       log(`⚠ Indeed batch fetch failed (will fallback to ScraperAPI): ${err}`);
     }
   }
 
   // 3b. Batch-fetch LinkedIn descriptions (0 ScraperAPI credits)
-  const linkedinJobs = newJobs.filter((j) => j.url.includes("linkedin.com/jobs/view/"));
+  const linkedinJobs = newJobs.filter((j) =>
+    j.url.includes("linkedin.com/jobs/view/"),
+  );
   if (linkedinJobs.length > 0) {
-    log(`⚡ Batch-fetching ${linkedinJobs.length} LinkedIn description(s) via guest API...`);
+    log(
+      `⚡ Batch-fetching ${linkedinJobs.length} LinkedIn description(s) via guest API...`,
+    );
     const jobIdMap = new Map<string, ScrapedJob>();
     for (const j of linkedinJobs) {
       const match = j.url.match(/\/jobs\/view\/(\d+)/);
       if (match) jobIdMap.set(match[1], j);
     }
     try {
-      const descriptions = await fetchLinkedInBatchDescriptions([...jobIdMap.keys()], log);
+      const descriptions = await fetchLinkedInBatchDescriptions(
+        [...jobIdMap.keys()],
+        log,
+      );
       let attached = 0;
       for (const [id, html] of Object.entries(descriptions)) {
         const job = jobIdMap.get(id);
@@ -174,23 +191,32 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
           attached++;
         }
       }
-      log(`✅ Pre-fetched ${attached}/${linkedinJobs.length} LinkedIn description(s) — 0 credits used.`);
+      log(
+        `✅ Pre-fetched ${attached}/${linkedinJobs.length} LinkedIn description(s) — 0 credits used.`,
+      );
     } catch (err) {
       log(`⚠ LinkedIn batch fetch failed: ${err}`);
     }
   }
 
   // 3c. Batch-fetch Offer Today descriptions (0 ScraperAPI credits)
-  const offerTodayJobs = newJobs.filter((j) => j.url.includes("offertoday.com/hk/job/"));
+  const offerTodayJobs = newJobs.filter((j) =>
+    j.url.includes("offertoday.com/hk/job/"),
+  );
   if (offerTodayJobs.length > 0) {
-    log(`⚡ Batch-fetching ${offerTodayJobs.length} Offer Today description(s) via public API...`);
+    log(
+      `⚡ Batch-fetching ${offerTodayJobs.length} Offer Today description(s) via public API...`,
+    );
     const jobIdMap = new Map<string, ScrapedJob>();
     for (const j of offerTodayJobs) {
       const match = j.url.match(/\/hk\/job\/([^/?#]+)/);
       if (match) jobIdMap.set(match[1], j);
     }
     try {
-      const descriptions = await fetchOfferTodayBatchDescriptions([...jobIdMap.keys()], log);
+      const descriptions = await fetchOfferTodayBatchDescriptions(
+        [...jobIdMap.keys()],
+        log,
+      );
       let attached = 0;
       for (const [id, html] of Object.entries(descriptions)) {
         const job = jobIdMap.get(id);
@@ -199,42 +225,15 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
           attached++;
         }
       }
-      log(`✅ Pre-fetched ${attached}/${offerTodayJobs.length} Offer Today description(s) — 0 credits used.`);
+      log(
+        `✅ Pre-fetched ${attached}/${offerTodayJobs.length} Offer Today description(s) — 0 credits used.`,
+      );
     } catch (err) {
       log(`⚠ Offer Today batch fetch failed: ${err}`);
     }
   }
 
-  // 4. Remove old duplicates (same user_id + title + company) before inserting fresh data
-  if (userId) {
-    const supabase = getSupabaseClient();
-    const pairs = newJobs.map((j) => ({ title: j.title, company: j.company }));
-    // Deduplicate the pairs to minimise queries
-    const uniquePairs = [...new Map(pairs.map((p) => [`${p.title}|||${p.company}`, p])).values()];
-    const BATCH_DEL = 20;
-    let totalDeleted = 0;
-    for (let i = 0; i < uniquePairs.length; i += BATCH_DEL) {
-      const batch = uniquePairs.slice(i, i + BATCH_DEL);
-      for (const { title, company } of batch) {
-        const { count, error } = await supabase
-          .from("jobs")
-          .delete({ count: "exact" })
-          .eq("user_id", userId)
-          .eq("title", title)
-          .eq("company", company);
-        if (error) {
-          log(`⚠ Dedup delete error (${title} @ ${company}): ${error.message}`);
-        } else if (count && count > 0) {
-          totalDeleted += count;
-        }
-      }
-    }
-    if (totalDeleted > 0) {
-      log(`🗑  Removed ${totalDeleted} old duplicate(s) (same title+company).`);
-    }
-  }
-
-  // 5. Fan-out: create one "process-job" per listing
+  // 4. Fan-out: create one "process-job" per listing
   log(`Dispatching ${newJobs.length} individual processing jobs...`);
   const childJobIds: string[] = [];
   for (const scrapedJob of newJobs) {
@@ -251,8 +250,15 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
     childJobIds.push(child.id!);
   }
 
-  log(`✓ Dispatched ${childJobIds.length} processing jobs — workers will pick them up in parallel.`);
-  return { childJobIds, totalJobs: newJobs.length, keyword: safeKeyword, scrapedDate };
+  log(
+    `✓ Dispatched ${childJobIds.length} processing jobs — workers will pick them up in parallel.`,
+  );
+  return {
+    childJobIds,
+    totalJobs: newJobs.length,
+    keyword: safeKeyword,
+    scrapedDate,
+  };
 }
 
 // ── Phase 2 handler: enrich + analyse + persist ONE job ───────────────────
