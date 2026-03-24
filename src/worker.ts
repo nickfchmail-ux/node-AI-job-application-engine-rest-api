@@ -106,23 +106,20 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
 
   // Filter out already-processed jobs
   let newJobs: ScrapedJob[] = uniqueJobs;
-  if (userId && !force) {
+  if (!force) {
     const supabase = getSupabaseClient();
-    const { data } = await supabase
-      .from("jobs")
-      .select("title, company")
-      .eq("user_id", userId);
+    let query = supabase.from("jobs").select("url");
+    if (userId) {
+      query = query.eq("user_id", userId);
+    } else {
+      query = query.is("user_id", null);
+    }
+    const { data } = await query;
     const existing = new Set(
-      (data ?? []).map(
-        (r: { title: string; company: string }) => `${r.title}|${r.company}`,
-      ),
+      (data ?? []).map((r: { url: string }) => r.url),
     );
-    const skipped = uniqueJobs.filter((j) =>
-      existing.has(`${j.title}|${j.company}`),
-    );
-    newJobs = uniqueJobs.filter(
-      (j) => !existing.has(`${j.title}|${j.company}`),
-    );
+    const skipped = uniqueJobs.filter((j) => existing.has(j.url));
+    newJobs = uniqueJobs.filter((j) => !existing.has(j.url));
     if (skipped.length > 0)
       log(`⏭  ${skipped.length} job(s) already in Supabase — skipping.`);
   }

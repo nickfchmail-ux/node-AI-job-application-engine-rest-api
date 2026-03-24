@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
   -- same job URL scraped by the same user on the same date = same record
-  UNIQUE (url, scraped_date, user_id)
+  UNIQUE NULLS NOT DISTINCT (url, scraped_date, user_id)
 );
 
 -- Auto-update updated_at on every row change
