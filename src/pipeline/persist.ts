@@ -50,7 +50,7 @@ export async function upsertToSupabase(
   // affect row a second time" from Postgres.
   const seen = new Set<string>();
   const rows = allRows.filter((r) => {
-    const key = `${r.url}|${r.scraped_date}|${r.user_id ?? ""}`;
+    const key = `${r.url}|${r.user_id ?? ""}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
