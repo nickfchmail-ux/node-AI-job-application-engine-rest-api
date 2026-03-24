@@ -287,21 +287,21 @@ async function processOneJob(job: Job<ProcessJobData>) {
   await upsertToSupabase([analysed], safeKeyword, scrapedDate, log, userId);
   log(`✓ Persisted to Supabase.`);
 
-  // 4. Remove older duplicates (same user_id + title + company), keep newest
+  // 4. Remove newer duplicates (same user_id + title + company), keep oldest (has user's application status)
   if (userId && analysed.title && analysed.company) {
     try {
       const supabase = getSupabaseClient();
-      // Find all rows matching this user+title+company, ordered by created_at desc
+      // Find all rows matching this user+title+company, ordered by created_at asc (oldest first)
       const { data: dupes, error: fetchErr } = await supabase
         .from("jobs")
         .select("id, created_at")
         .eq("user_id", userId)
         .eq("title", analysed.title)
         .eq("company", analysed.company)
-        .order("created_at", { ascending: false });
+        .order("created_at", { ascending: true });
 
       if (!fetchErr && dupes && dupes.length > 1) {
-        // Keep the first (newest), delete the rest
+        // Keep the first (oldest — has application status), delete the rest
         const idsToDelete = dupes.slice(1).map((d) => d.id);
         const { error: delErr } = await supabase
           .from("jobs")
@@ -310,7 +310,7 @@ async function processOneJob(job: Job<ProcessJobData>) {
         if (delErr) {
           log(`⚠ Dedup delete error: ${delErr.message}`);
         } else {
-          log(`🗑  Removed ${idsToDelete.length} older duplicate(s) for "${analysed.title} @ ${analysed.company}".`);
+          log(`🗑  Removed ${idsToDelete.length} newer duplicate(s) for "${analysed.title} @ ${analysed.company}".`);
         }
       }
     } catch (err) {
