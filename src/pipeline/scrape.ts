@@ -6,6 +6,7 @@ import {
   JobsDBScraper,
   LinkedInScraper,
   MultiboardScraper,
+  OfferTodayScraper,
 } from "../scrapers";
 
 /**
@@ -40,16 +41,17 @@ function parseRelativeDate(raw: string | undefined): string | undefined {
   return undefined; // "Promoted", unknown — discard
 }
 
-const ALL_BOARDS = ["jobsdb", "indeed", "ctgoodjobs", "linkedin"] as const;
+const ALL_BOARDS = ["jobsdb", "indeed", "ctgoodjobs", "linkedin", "offertoday"] as const;
 type BoardKey = (typeof ALL_BOARDS)[number];
 
-export const DEFAULT_BOARDS: BoardKey[] = ["jobsdb", "ctgoodjobs", "indeed", "linkedin"];
+export const DEFAULT_BOARDS: BoardKey[] = ["jobsdb", "ctgoodjobs", "indeed", "linkedin", "offertoday"];
 
 const BOARD_FACTORIES: Record<BoardKey, () => JobScraper> = {
   jobsdb: () => new JobsDBScraper(),
   indeed: () => new IndeedScraper(),
   ctgoodjobs: () => new CTgoodjobsScraper(),
   linkedin: () => new LinkedInScraper(),
+  offertoday: () => new OfferTodayScraper(),
 };
 
 export async function scrapeJobs(

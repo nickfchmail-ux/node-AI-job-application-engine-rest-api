@@ -252,6 +252,34 @@ async function scrapeDetailFetch(url: string): Promise<JobDetail | null> {
     }
   }
 
+  // Offer Today detail pages: use public detail API (0 credits)
+  if (hostname.includes("offertoday.com")) {
+    const jobIdMatch = url.match(/\/hk\/job\/([^/?#]+)/);
+    if (!jobIdMatch) return { ...EMPTY_DETAIL };
+    const detailUrl =
+      `https://www.offertoday.com/wapi/geek/recommend/jobDetail` +
+      `?encryptJobId=${encodeURIComponent(jobIdMatch[1])}&lid=x`;
+    try {
+      const res = await fetch(detailUrl, {
+        headers: { ...FETCH_HEADERS, Accept: "application/json" },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) return { ...EMPTY_DETAIL };
+      const json = await res.json();
+      if (json.code !== 0 || !json.data) return { ...EMPTY_DETAIL };
+      const descHtml = json.data.translateJobDesc || json.data.jobDesc;
+      if (descHtml) {
+        const raw = htmlToText(descHtml);
+        if (raw.length > 50) {
+          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+        }
+      }
+      return { ...EMPTY_DETAIL };
+    } catch {
+      return { ...EMPTY_DETAIL };
+    }
+  }
+
   // JobsDB and CTgoodjobs require a real browser — skip fetch, go straight to Playwright
   if (PLAYWRIGHT_ONLY_HOSTS.some((h) => hostname.includes(h))) return null;
 

@@ -18,6 +18,7 @@ import {
 import { redisConnection } from "./queue/redis";
 import { fetchIndeedBatchDescriptions } from "./scrapers/indeed";
 import { fetchLinkedInBatchDescriptions } from "./scrapers/linkedin";
+import { fetchOfferTodayBatchDescriptions } from "./scrapers/offertoday";
 
 loadEnvLocal();
 
@@ -176,6 +177,31 @@ async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeResult> 
       log(`✅ Pre-fetched ${attached}/${linkedinJobs.length} LinkedIn description(s) — 0 credits used.`);
     } catch (err) {
       log(`⚠ LinkedIn batch fetch failed: ${err}`);
+    }
+  }
+
+  // 3c. Batch-fetch Offer Today descriptions (0 ScraperAPI credits)
+  const offerTodayJobs = newJobs.filter((j) => j.url.includes("offertoday.com/hk/job/"));
+  if (offerTodayJobs.length > 0) {
+    log(`⚡ Batch-fetching ${offerTodayJobs.length} Offer Today description(s) via public API...`);
+    const jobIdMap = new Map<string, ScrapedJob>();
+    for (const j of offerTodayJobs) {
+      const match = j.url.match(/\/hk\/job\/([^/?#]+)/);
+      if (match) jobIdMap.set(match[1], j);
+    }
+    try {
+      const descriptions = await fetchOfferTodayBatchDescriptions([...jobIdMap.keys()], log);
+      let attached = 0;
+      for (const [id, html] of Object.entries(descriptions)) {
+        const job = jobIdMap.get(id);
+        if (job && html) {
+          job.rawDetailHtml = html;
+          attached++;
+        }
+      }
+      log(`✅ Pre-fetched ${attached}/${offerTodayJobs.length} Offer Today description(s) — 0 credits used.`);
+    } catch (err) {
+      log(`⚠ Offer Today batch fetch failed: ${err}`);
     }
   }
 
