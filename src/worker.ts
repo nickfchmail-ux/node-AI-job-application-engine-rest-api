@@ -108,22 +108,35 @@ async function processScrapeJob(
   if (uniqueJobs.length === 0)
     throw new Error("No jobs found for this keyword.");
 
-  // Filter out already-processed jobs
+  // Filter out already-processed jobs (by URL and by title+company)
   let newJobs: ScrapedJob[] = uniqueJobs;
   if (!force) {
     const supabase = getSupabaseClient();
-    let query = supabase.from("jobs").select("url");
+    let query = supabase.from("jobs").select("url, title, company");
     if (userId) {
       query = query.eq("user_id", userId);
     } else {
       query = query.is("user_id", null);
     }
     const { data } = await query;
-    const existing = new Set((data ?? []).map((r: { url: string }) => r.url));
-    const skipped = uniqueJobs.filter((j) => existing.has(j.url));
-    newJobs = uniqueJobs.filter((j) => !existing.has(j.url));
-    if (skipped.length > 0)
-      log(`⏭  ${skipped.length} job(s) already in Supabase — skipping.`);
+    const existingUrls = new Set((data ?? []).map((r: { url: string }) => r.url));
+    const existingTitleCompany = new Set(
+      (data ?? []).map((r: { title: string; company: string }) => `${r.title}|||${r.company}`),
+    );
+
+    const urlSkipped = uniqueJobs.filter((j) => existingUrls.has(j.url));
+    const afterUrl = uniqueJobs.filter((j) => !existingUrls.has(j.url));
+    const titleCompanySkipped = afterUrl.filter((j) =>
+      existingTitleCompany.has(`${j.title}|||${j.company}`),
+    );
+    newJobs = afterUrl.filter(
+      (j) => !existingTitleCompany.has(`${j.title}|||${j.company}`),
+    );
+
+    if (urlSkipped.length > 0)
+      log(`⏭  ${urlSkipped.length} job(s) already in Supabase (same URL) — skipping.`);
+    if (titleCompanySkipped.length > 0)
+      log(`⏭  ${titleCompanySkipped.length} job(s) already in Supabase (same title+company) — skipping.`);
   }
 
   if (newJobs.length === 0) {
@@ -270,6 +283,22 @@ async function processOneJob(job: Job<ProcessJobData>) {
     job.log(msg).catch(() => {});
   };
 
+  // 0. Skip if a row with the same title+company already exists for this user
+  if (!force && userId && scrapedJob.title && scrapedJob.company) {
+    const supabase = getSupabaseClient();
+    const { data: existing } = await supabase
+      .from("jobs")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("title", scrapedJob.title)
+      .eq("company", scrapedJob.company)
+      .limit(1);
+    if (existing && existing.length > 0) {
+      log(`⏭  Skipping "${scrapedJob.title} @ ${scrapedJob.company}" — already exists for this user.`);
+      return { title: scrapedJob.title, company: scrapedJob.company, fit: false, score: 0, skipped: true };
+    }
+  }
+
   // 1. Enrich
   log(`Enriching: ${scrapedJob.title} @ ${scrapedJob.company}`);
   const enriched = await enrichOneJob(scrapedJob, log);
@@ -283,40 +312,23 @@ async function processOneJob(job: Job<ProcessJobData>) {
     : `❌ NO FIT (${analysis.score})`;
   log(`${scrapedJob.title} @ ${scrapedJob.company} — ${tag}`);
 
-  // 3. Persist
-  await upsertToSupabase([analysed], safeKeyword, scrapedDate, log, userId);
-  log(`✓ Persisted to Supabase.`);
-
-  // 4. Remove newer duplicates (same user_id + title + company), keep oldest (has user's application status)
+  // 3. Persist (only if no existing row with same title+company for this user)
   if (userId && analysed.title && analysed.company) {
-    try {
-      const supabase = getSupabaseClient();
-      // Find all rows matching this user+title+company, ordered by created_at asc (oldest first)
-      const { data: dupes, error: fetchErr } = await supabase
-        .from("jobs")
-        .select("id, created_at")
-        .eq("user_id", userId)
-        .eq("title", analysed.title)
-        .eq("company", analysed.company)
-        .order("created_at", { ascending: true });
-
-      if (!fetchErr && dupes && dupes.length > 1) {
-        // Keep the first (oldest — has application status), delete the rest
-        const idsToDelete = dupes.slice(1).map((d) => d.id);
-        const { error: delErr } = await supabase
-          .from("jobs")
-          .delete()
-          .in("id", idsToDelete);
-        if (delErr) {
-          log(`⚠ Dedup delete error: ${delErr.message}`);
-        } else {
-          log(`🗑  Removed ${idsToDelete.length} newer duplicate(s) for "${analysed.title} @ ${analysed.company}".`);
-        }
-      }
-    } catch (err) {
-      log(`⚠ Dedup cleanup failed: ${err}`);
+    const supabase = getSupabaseClient();
+    const { data: existing } = await supabase
+      .from("jobs")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("title", analysed.title)
+      .eq("company", analysed.company)
+      .limit(1);
+    if (existing && existing.length > 0) {
+      log(`⏭  "${analysed.title} @ ${analysed.company}" already in Supabase — skipping insert.`);
+      return { title: analysed.title, company: analysed.company, fit: analysis.fit, score: analysis.score, skipped: true };
     }
   }
+  await upsertToSupabase([analysed], safeKeyword, scrapedDate, log, userId);
+  log(`✓ Persisted to Supabase.`);
 
   return {
     title: analysed.title,
