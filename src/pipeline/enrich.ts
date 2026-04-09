@@ -341,19 +341,25 @@ async function scrapeDetailPlaywright(
     const page = await browserContext.newPage();
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+      // CTgoodjobs migrated to Next.js App Router (RSC) in 2026.
+      // #jd__desc no longer exists; wait for the new .jd__main wrapper instead.
       await page
-        .waitForSelector("#jd__desc", {
-          timeout: 10000,
+        .waitForSelector(".jd__main, .jd__desc, #jd__desc", {
+          timeout: 12000,
         })
         .catch(() => {});
       const raw = await page.evaluate(() => {
-        const el = document.querySelector("#jd__desc") as HTMLElement | null;
-        if (el?.innerText && el.innerText.length > 50) return el.innerText;
-        // Fallback: try broader selectors
-        const fallbacks = [".jd__desc", "[class*='jd__desc']", ".jd__content"];
-        for (const sel of fallbacks) {
-          const fb = document.querySelector(sel) as HTMLElement | null;
-          if (fb?.innerText && fb.innerText.length > 50) return fb.innerText;
+        // Try selectors in priority order (new → old for backward compat)
+        const selectors = [
+          ".jd__desc",
+          "#jd__desc",
+          "[class*='jd__desc']",
+          ".jd__main",
+          ".jd__content",
+        ];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (el?.innerText && el.innerText.length > 50) return el.innerText;
         }
         return "";
       });

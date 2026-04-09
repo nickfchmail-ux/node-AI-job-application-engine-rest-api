@@ -1,8 +1,9 @@
-import * as cheerio from "cheerio";
 import { Job } from "./types";
 
 const BASE_URL = "https://jobs.ctgoodjobs.hk";
 const MAX_PAGES = 5;
+/** Jobs returned per page by CTgoodjobs RSC (observed: 18) */
+const PAGE_SIZE = 18;
 
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -10,12 +11,30 @@ const USER_AGENTS = [
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ];
 
+interface RscSalary {
+  salaryValue?: string;
+  salaryFrom?: string | null;
+  salaryTo?: string | null;
+}
+interface RscPublishTime { date?: string; }
+interface RscJobEntry {
+  jobId: string;
+  jobTitle: string;
+  url: string;
+  companyName: string;
+  publishTime: string | RscPublishTime;
+  salary: string | RscSalary;
+  locations: string | string[];
+}
+
 /**
- * CTgoodjobs scraper using plain HTTP fetch + cheerio.
+ * CTgoodjobs scraper using plain HTTP fetch + Next.js RSC payload parsing.
  *
- * CTgoodjobs serves a "Human Verification" CAPTCHA to headless browsers
- * (Playwright) from datacenter IPs, but plain HTTP requests get the real
- * server-rendered HTML. This scraper avoids Playwright entirely.
+ * CTgoodjobs migrated to Next.js App Router in early 2026. The listing page
+ * is now a React Server Components app: the full job data is embedded in the
+ * server-rendered HTML inside  self.__next_f.push([1, "..."])  script blocks
+ * using the RSC flight protocol. Plain HTTP fetch retrieves this data without
+ * a browser. This scraper replaces the old cheerio approach.
  *
  * Implements the same interface that MultiboardScraper expects:
  *   name, log, scrape(keyword, pages)
@@ -68,46 +87,100 @@ export class CTgoodjobsScraper {
     return resp.text();
   }
 
-  private parseJobs(html: string): Omit<Job, "source">[] {
-    const $ = cheerio.load(html);
+  /**
+   * Parse job listings from the Next.js RSC (React Server Components) payload
+   * embedded in the page HTML as self.__next_f.push([1, "..."]) script blocks.
+   *
+   * The RSC flight protocol uses a flat map of hexKey → JSON value with
+   * $hexKey references for nested objects (salary, publishTime, locations).
+   */
+  private parseRscJobs(html: string): Omit<Job, "source">[] {
+    // 1. Collect and unescape all RSC push chunks
+    const chunks: string[] = [];
+    const rscRegex = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = rscRegex.exec(html)) !== null) {
+      try { chunks.push(JSON.parse('"' + m[1] + '"')); } catch { /* skip malformed */ }
+    }
+    if (chunks.length === 0) return [];
+    const fullRsc = chunks.join("\n");
+
+    // 2. Parse RSC entries: hexKey:jsonValue (one per line)
+    const rscMap = new Map<string, unknown>();
+    const entryRegex = /^([0-9a-f]+):(.+)$/mg;
+    let em: RegExpExecArray | null;
+    while ((em = entryRegex.exec(fullRsc)) !== null) {
+      try { rscMap.set(em[1], JSON.parse(em[2])); } catch { /* skip */ }
+    }
+
+    // 3. Find job objects and resolve $ref pointers
     const results: Omit<Job, "source">[] = [];
+    for (const [, entry] of rscMap) {
+      if (
+        typeof entry !== "object" || entry === null ||
+        !("jobId" in entry) || !("jobTitle" in entry) ||
+        !("url" in entry) || !("companyName" in entry)
+      ) continue;
 
-    $("div.job-card").each((_, card) => {
-      const titleEl = $(card).find("a.jc-position h2");
-      const title = titleEl.text().trim();
-      if (!title) return;
+      const job = entry as RscJobEntry;
 
-      const company = $(card).find("a.jc-company").text().trim() || "N/A";
-      const location =
-        $(card).find(".jc-info .col-12").first().text().trim() || "N/A";
-      const postedDate = $(card).find(".jc-other").text().trim() || undefined;
+      // Resolve salary ($ref → { salaryValue, ... })
+      let salary: string | undefined;
+      const salaryRef =
+        typeof job.salary === "string" && job.salary.startsWith("$")
+          ? job.salary.slice(1)
+          : null;
+      if (salaryRef) {
+        const s = rscMap.get(salaryRef) as RscSalary | undefined;
+        if (s?.salaryValue && s.salaryValue !== "N/A") salary = s.salaryValue;
+      }
 
-      const linkEl = $(card).find("a.jc-position");
-      const href = linkEl.attr("href") || "";
-      const url = href.startsWith("http") ? href : `${BASE_URL}${href}`;
+      // Resolve publishTime ($ref → { date, ... })
+      let postedDate: string | undefined;
+      const ptRef =
+        typeof job.publishTime === "string" && job.publishTime.startsWith("$")
+          ? job.publishTime.slice(1)
+          : null;
+      if (ptRef) {
+        const pt = rscMap.get(ptRef) as RscPublishTime | undefined;
+        if (pt?.date) postedDate = pt.date;
+      }
 
-      results.push({ title, company, location, postedDate, url });
-    });
+      // Resolve locations ($ref → string[])
+      let location = "Hong Kong";
+      const locRef =
+        typeof job.locations === "string" && job.locations.startsWith("$")
+          ? job.locations.slice(1)
+          : null;
+      if (locRef) {
+        const locArr = rscMap.get(locRef);
+        if (Array.isArray(locArr) && locArr.length > 0 && typeof locArr[0] === "string") {
+          location = locArr[0];
+        }
+      }
+
+      results.push({
+        title: (job.jobTitle as string).replace(/<[^>]+>/g, "").trim(),
+        company: job.companyName as string,
+        location,
+        salary,
+        postedDate,
+        url: job.url as string,
+      });
+    }
 
     return results;
   }
 
-  private getTotalPages(html: string): number {
-    const $ = cheerio.load(html);
-    // Look for highest page= param in pagination links
-    let maxPage = 1;
-    $("a[href*='page=']").each((_, el) => {
-      const href = $(el).attr("href") || "";
-      const m = href.match(/[?&]page=(\d+)/);
-      if (m) maxPage = Math.max(maxPage, parseInt(m[1], 10));
-    });
-    // Also check aria-label for "last page (N)"
-    $("a").each((_, el) => {
-      const label = $(el).attr("aria-label") || $(el).text();
-      const m = label.match(/last.*?(\d+)/i);
-      if (m) maxPage = Math.max(maxPage, parseInt(m[1], 10));
-    });
-    return Math.min(maxPage, MAX_PAGES);
+  /**
+   * Extract total job count from the Schema.org ItemList embedded in the RSC.
+   * Returns 1 (single page) when not found.
+   */
+  private getTotalPagesFromRsc(html: string, pageSize = PAGE_SIZE): number {
+    const m = html.match(/"numberOfItems":(\d+)/);
+    if (!m) return 1;
+    const total = parseInt(m[1], 10);
+    return Math.min(Math.ceil(total / pageSize), MAX_PAGES);
   }
 
   async scrape(keyword: string, pages = 0): Promise<Job[]> {
@@ -124,14 +197,14 @@ export class CTgoodjobsScraper {
       return [];
     }
 
-    const firstJobs = this.parseJobs(html1);
+    const firstJobs = this.parseRscJobs(html1);
     if (firstJobs.length === 0) {
-      this.log(`[${this.name}] 0 jobs on page 1 — possible layout change`);
+      this.log(`[${this.name}] 0 jobs on page 1 — RSC parsing found nothing (possible site change)`);
       return [];
     }
 
     const totalPages = autoMode
-      ? this.getTotalPages(html1)
+      ? this.getTotalPagesFromRsc(html1)
       : Math.min(pages, MAX_PAGES);
 
     this.log(
@@ -146,7 +219,7 @@ export class CTgoodjobsScraper {
       const settled = await Promise.allSettled(
         pageNums.map(async (p) => {
           const html = await this.fetchPage(this.buildUrl(keyword, p));
-          return this.parseJobs(html);
+          return this.parseRscJobs(html);
         }),
       );
 
