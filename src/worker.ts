@@ -69,7 +69,7 @@ async function processScrapeJob(
   const { keyword, pages, force, boards, userId, countryCode } = job.data;
   const log = (msg: string) => {
     console.log(`[job ${job.id}]`, msg);
-    job.log(msg).catch(() => {});
+    job.log(msg).catch(() => { });
   };
 
   const cleanKeyword = keyword
@@ -124,8 +124,10 @@ async function processScrapeJob(
       (data ?? []).map((r: { title: string; company: string }) => `${r.title}|||${r.company}`),
     );
 
-    const urlSkipped = uniqueJobs.filter((j) => existingUrls.has(j.url));
+    // const urlSkipped = uniqueJobs.filter((j) => existingUrls.has(j.url));
     const afterUrl = uniqueJobs.filter((j) => !existingUrls.has(j.url));
+    const urlSkipped = uniqueJobs.length - afterUrl.length;
+
     const titleCompanySkipped = afterUrl.filter((j) =>
       existingTitleCompany.has(`${j.title}|||${j.company}`),
     );
@@ -133,8 +135,8 @@ async function processScrapeJob(
       (j) => !existingTitleCompany.has(`${j.title}|||${j.company}`),
     );
 
-    if (urlSkipped.length > 0)
-      log(`⏭  ${urlSkipped.length} job(s) already in Supabase (same URL) — skipping.`);
+    if (urlSkipped > 0)
+      log(`⏭  ${urlSkipped} job(s) already in Supabase (same URL) — skipping.`);
     if (titleCompanySkipped.length > 0)
       log(`⏭  ${titleCompanySkipped.length} job(s) already in Supabase (same title+company) — skipping.`);
   }
@@ -280,7 +282,7 @@ async function processOneJob(job: Job<ProcessJobData>) {
     job.data;
   const log = (msg: string) => {
     console.log(`[job ${job.id}]`, msg);
-    job.log(msg).catch(() => {});
+    job.log(msg).catch(() => { });
   };
 
   // 0. Skip if a row with the same title+company already exists for this user

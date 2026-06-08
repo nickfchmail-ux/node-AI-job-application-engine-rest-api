@@ -1,0 +1,79 @@
+services:
+  # ── API Server ────────────────────────────────────────────────────────────
+  - type: web
+    name: ai-job-server
+    env: docker
+    dockerfilePath: ./Dockerfile.server
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8080
+      # Set these secrets in Render dashboard → Environment
+      - key: REDIS_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: SCRAPERAPI_KEY
+        sync: false
+
+  # ── Worker 1 ─────────────────────────────────────────────────────────────
+  - type: web
+    name: ai-job-worker-1
+    env: docker
+    dockerfilePath: ./Dockerfile.worker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8080
+      - key: WORKER_CONCURRENCY
+        value: 1
+      - key: REDIS_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: SCRAPERAPI_KEY
+        sync: false
+
+  # ── Worker 2 ─────────────────────────────────────────────────────────────
+  - type: web
+    name: ai-job-worker-2
+    env: docker
+    dockerfilePath: ./Dockerfile.worker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8080
+      - key: WORKER_CONCURRENCY
+        value: 1
+      - key: REDIS_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: SCRAPERAPI_KEY
+        sync: false
