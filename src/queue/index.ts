@@ -1,4 +1,5 @@
 import { Queue } from "bullmq";
+import type { ResumeProfile } from "../pipeline/analyze";
 import type { Job as ScrapedJob } from "../pipeline/types";
 import { redisConnection } from "./redis";
 
@@ -13,6 +14,7 @@ export interface ScrapeJobData {
   boards?: string[];
   userId: string;
   countryCode?: string;
+  generateCoverLetter?: boolean;
 }
 
 /** Phase 2 – enrich + analyse + persist ONE listing */
@@ -20,6 +22,8 @@ export interface ProcessJobData {
   type: "process-job";
   scrapedJob: ScrapedJob;
   resumeText: string;
+  resumeProfile: ResumeProfile;
+  generateCoverLetter: boolean;
   safeKeyword: string;
   scrapedDate: string;
   userId: string;

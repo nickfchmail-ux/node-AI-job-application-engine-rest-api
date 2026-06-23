@@ -1,7 +1,7 @@
 import { Job, Queue, Worker } from "bullmq";
 import express from "express";
 import { getSupabaseClient, loadEnvLocal } from "./db";
-import { analyzeOne } from "./pipeline/analyze";
+import { analyzeOne, summarizeResume } from "./pipeline/analyze";
 import { browserPool } from "./pipeline/browserPool";
 import { enrichOneJob } from "./pipeline/enrich";
 import { upsertToSupabase } from "./pipeline/persist";
@@ -87,6 +87,28 @@ async function processScrapeJob(
 
   // 1. Load resume
   const resumeText = await loadResumeText(userId, log);
+
+  // 1b. Summarize resume once — reuse for all child jobs (saves ~75% input tokens)
+  log("Summarizing resume profile with DeepSeek...");
+  let resumeProfile;
+  try {
+    resumeProfile = await summarizeResume(resumeText);
+    log(
+      `Resume profile: ${resumeProfile.currentRole}, ${resumeProfile.yearsOfExperience}y exp, ${resumeProfile.keySkills.length} skills`,
+    );
+  } catch (err) {
+    log(`⚠ Resume summarization failed: ${err} — falling back to raw resume text`);
+    // Build a minimal profile so the pipeline can continue
+    resumeProfile = {
+      yearsOfExperience: 0,
+      currentRole: "Unknown",
+      keySkills: [],
+      education: "Unknown",
+      industries: [],
+      languages: [],
+      summary: resumeText.slice(0, 500),
+    };
+  }
 
   // 2. Scrape
   const boardList = boards?.length ? boards : [...DEFAULT_BOARDS];
@@ -262,6 +284,8 @@ async function processScrapeJob(
       type: "process-job" as const,
       scrapedJob,
       resumeText,
+      resumeProfile,
+      generateCoverLetter: job.data.generateCoverLetter ?? true,
       safeKeyword,
       scrapedDate,
       userId,
@@ -310,7 +334,7 @@ async function tryAcquireProcessingLock(
 
 // ── Phase 2 handler: enrich + analyse + persist ONE job ───────────────────
 async function processOneJob(job: Job<ProcessJobData>) {
-  const { scrapedJob, resumeText, safeKeyword, scrapedDate, userId, force } =
+  const { scrapedJob, resumeProfile, safeKeyword, scrapedDate, userId, force, generateCoverLetter } =
     job.data;
   const log = (msg: string) => {
     console.log(`[job ${job.id}]`, msg);
@@ -361,7 +385,7 @@ async function processOneJob(job: Job<ProcessJobData>) {
 
   // 3. Analyse
   log(`Analysing fit with DeepSeek...`);
-  const analysis = await analyzeOne(resumeText, enriched);
+  const analysis = await analyzeOne(resumeProfile, enriched, generateCoverLetter);
   const analysed = { ...enriched, fitAnalysis: analysis };
   const tag = analysis.fit
     ? `✅ FIT (${analysis.score})`
