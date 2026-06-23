@@ -16,6 +16,9 @@ function parseRedisUrl(url: string): ConnectionOptions {
     maxRetriesPerRequest: null,
     retryStrategy: (times: number) => Math.min(times * 500, 10_000),
     enableOfflineQueue: true,
+    // Fail the initial connection quickly (10s) so the API server
+    // returns an error instead of hanging. Workers retry via retryStrategy.
+    connectTimeout: 10_000,
   };
   if (u.password) opts.password = decodeURIComponent(u.password);
   if (u.username) opts.username = u.username;
