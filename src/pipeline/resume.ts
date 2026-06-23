@@ -3,10 +3,13 @@ import mammoth from "mammoth";
 import * as path from "path";
 import { getSupabaseClient } from "../db";
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const pdfParse = require("pdf-parse") as (
-  buf: Buffer,
-) => Promise<{ text: string }>;
+import { PDFParse } from "pdf-parse";
+
+async function extractTextFromPdf(buf: Buffer): Promise<string> {
+  const parser = new PDFParse({ data: buf });
+  const result = await parser.getText();
+  return result.text;
+}
 
 async function extractTextFromBuffer(
   buf: Buffer,
@@ -14,8 +17,7 @@ async function extractTextFromBuffer(
 ): Promise<string> {
   const ext = path.extname(filename).toLowerCase();
   if (ext === ".pdf") {
-    const result = await pdfParse(buf);
-    return result.text;
+    return extractTextFromPdf(buf);
   }
   if (ext === ".docx") {
     const result = await mammoth.extractRawText({ buffer: buf });
