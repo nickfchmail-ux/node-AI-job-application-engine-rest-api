@@ -21,7 +21,7 @@ services:
         sync: false
       - key: JWT_SECRET
         sync: false
-      - key: DEEPSEEK_API_KEY
+      - key: DEEP_SEEK_API
         sync: false
       - key: SCRAPERAPI_KEY
         sync: false
@@ -47,7 +47,7 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: DEEPSEEK_API_KEY
+      - key: DEEP_SEEK_API
         sync: false
       - key: SCRAPERAPI_KEY
         sync: false
@@ -73,7 +73,7 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: DEEPSEEK_API_KEY
+      - key: DEEP_SEEK_API
         sync: false
       - key: SCRAPERAPI_KEY
         sync: false

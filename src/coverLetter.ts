@@ -47,8 +47,8 @@ async function analyzeWithDeepSeek(
   resumeText: string,
   job: EnrichedJob,
 ): Promise<FitAnalysis> {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) throw new Error("DEEPSEEK_API_KEY is not set");
+  const apiKey = process.env.DEEP_SEEK_API;
+  if (!apiKey) throw new Error("DEEP_SEEK_API is not set");
 
   const jobSummary = `
 Job Title: ${job.title}
