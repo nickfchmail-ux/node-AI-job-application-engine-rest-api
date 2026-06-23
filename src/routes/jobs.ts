@@ -94,18 +94,19 @@ router.post("/scrape", requireAuth, async (req: Request, res: Response) => {
 router.get("/jobs/:jobId", requireAuth, async (req: Request, res: Response) => {
   const jobId = String(req.params.jobId);
 
-  // ── Return cached terminal result (zero Redis calls) ────────────────────
-  const cached = getCached(jobId);
-  if (cached) {
-    res.status(cached.status).json(cached.body);
-    return;
-  }
+  try {
+    // ── Return cached terminal result (zero Redis calls) ────────────────────
+    const cached = getCached(jobId);
+    if (cached) {
+      res.status(cached.status).json(cached.body);
+      return;
+    }
 
-  const job = await Job.fromId<PipelineJobData>(pipelineQueue, jobId);
-  if (!job) {
-    res.status(404).json({ error: "Job not found" });
-    return;
-  }
+    const job = await Job.fromId<PipelineJobData>(pipelineQueue, jobId);
+    if (!job) {
+      res.status(404).json({ error: "Job not found" });
+      return;
+    }
 
   // Ownership check
   if (job.data.userId !== req.userId) {
@@ -231,6 +232,10 @@ router.get("/jobs/:jobId", requireAuth, async (req: Request, res: Response) => {
     delayed: "pending",
   };
   res.json({ status: statusMap[state] ?? state, logs });
+  } catch (err) {
+    console.error("[jobs] Error fetching job:", err);
+    res.status(500).json({ error: "Internal server error — please try again" });
+  }
 });
 
 export default router;
