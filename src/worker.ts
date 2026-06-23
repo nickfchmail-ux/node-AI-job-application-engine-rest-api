@@ -55,6 +55,9 @@ server.on("error", (err) => {
 // ----------------------------------------------------------------------
 const workerQueue = new Queue<PipelineJobData, unknown, string>(QUEUE_NAME, {
   connection: redisConnection,
+  defaultJobOptions: {
+    attempts: 1, // never auto-retry — retries would duplicate DeepSeek calls
+  },
 });
 
 // ----------------------------------------------------------------------

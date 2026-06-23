@@ -63,6 +63,23 @@ router.post("/scrape", requireAuth, async (req: Request, res: Response) => {
   }
 
   try {
+    // ── Prevent duplicate scrape submissions for same user+keyword ─────────
+    const existingJobs = await pipelineQueue.getJobs(["active", "waiting", "delayed"]);
+    const duplicate = existingJobs.find(
+      (j) =>
+        j.data.type === "scrape" &&
+        j.data.userId === req.userId &&
+        j.data.keyword.trim().toLowerCase() === keyword.trim().toLowerCase(),
+    );
+    if (duplicate) {
+      res.status(202).json({
+        jobId: duplicate.id,
+        pollUrl: `/jobs/${duplicate.id}`,
+        note: "An identical scrape is already in progress — returning existing job.",
+      });
+      return;
+    }
+
     // Timeout after 15s — Redis may be unreachable (e.g. cold start, network)
     const job = await Promise.race([
       pipelineQueue.add("scrape", {
