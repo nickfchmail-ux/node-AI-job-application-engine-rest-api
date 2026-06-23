@@ -279,6 +279,32 @@ async function processScrapeJob(
   };
 }
 
+// ── Distributed lock helper ────────────────────────────────────────────────
+// Uses Redis SETNX to ensure a given (userId, title, company) is processed
+// by at most one worker at a time, preventing duplicate DeepSeek API calls.
+async function tryAcquireProcessingLock(
+  userId: string,
+  title: string,
+  company: string,
+  ttlSeconds: number,
+): Promise<boolean> {
+  try {
+    const client = await workerQueue.client;
+    const safeTitle = title.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 80);
+    const safeCompany = company.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 80);
+    const key = `lock:process:${userId}:${safeTitle}:${safeCompany}`;
+    const result = await client.set(key, "1", "EX", ttlSeconds, "NX");
+    return result === "OK";
+  } catch (err) {
+    // If Redis is unreachable, allow processing rather than blocking everything
+    console.error(
+      "[worker] Failed to acquire processing lock (allowing pass-through):",
+      err,
+    );
+    return true;
+  }
+}
+
 // ── Phase 2 handler: enrich + analyse + persist ONE job ───────────────────
 async function processOneJob(job: Job<ProcessJobData>) {
   const { scrapedJob, resumeText, safeKeyword, scrapedDate, userId, force } =
@@ -288,7 +314,29 @@ async function processOneJob(job: Job<ProcessJobData>) {
     job.log(msg).catch(() => { });
   };
 
-  // 0. Skip if a row with the same title+company already exists for this user
+  // 0. Acquire distributed lock to prevent duplicate DeepSeek calls across workers
+  if (userId && scrapedJob.title && scrapedJob.company) {
+    const acquired = await tryAcquireProcessingLock(
+      userId,
+      scrapedJob.title,
+      scrapedJob.company,
+      LOCK_DURATION_MS / 1000,
+    );
+    if (!acquired) {
+      log(
+        `⏭  Skipping "${scrapedJob.title} @ ${scrapedJob.company}" — another worker is already processing it.`,
+      );
+      return {
+        title: scrapedJob.title,
+        company: scrapedJob.company,
+        fit: false,
+        score: 0,
+        skipped: true,
+      };
+    }
+  }
+
+  // 1. Skip if a row with the same title+company already exists for this user
   if (!force && userId && scrapedJob.title && scrapedJob.company) {
     const supabase = getSupabaseClient();
     const { data: existing } = await supabase
@@ -304,11 +352,11 @@ async function processOneJob(job: Job<ProcessJobData>) {
     }
   }
 
-  // 1. Enrich
+  // 2. Enrich
   log(`Enriching: ${scrapedJob.title} @ ${scrapedJob.company}`);
   const enriched = await enrichOneJob(scrapedJob, log);
 
-  // 2. Analyse
+  // 3. Analyse
   log(`Analysing fit with DeepSeek...`);
   const analysis = await analyzeOne(resumeText, enriched);
   const analysed = { ...enriched, fitAnalysis: analysis };
@@ -317,7 +365,7 @@ async function processOneJob(job: Job<ProcessJobData>) {
     : `❌ NO FIT (${analysis.score})`;
   log(`${scrapedJob.title} @ ${scrapedJob.company} — ${tag}`);
 
-  // 3. Persist (only if no existing row with same title+company for this user)
+  // 4. Persist (only if no existing row with same title+company for this user)
   if (userId && analysed.title && analysed.company) {
     const supabase = getSupabaseClient();
     const { data: existing } = await supabase
