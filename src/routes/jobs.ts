@@ -62,18 +62,28 @@ router.post("/scrape", requireAuth, async (req: Request, res: Response) => {
     return;
   }
 
-  const job = await pipelineQueue.add("scrape", {
-    type: "scrape" as const,
-    keyword: keyword.trim(),
-    pages: Number(pages) || 1,
-    force: Boolean(force),
-    boards: Array.isArray(boards) ? boards : undefined,
-    userId: req.userId!,
-    countryCode:
-      typeof country_code === "string" ? country_code.slice(0, 5) : undefined,
-  });
+  try {
+    // Timeout after 15s — Redis may be unreachable (e.g. cold start, network)
+    const job = await Promise.race([
+      pipelineQueue.add("scrape", {
+        type: "scrape" as const,
+        keyword: keyword.trim(),
+        pages: Number(pages) || 1,
+        force: Boolean(force),
+        boards: Array.isArray(boards) ? boards : undefined,
+        userId: req.userId!,
+        countryCode:
+          typeof country_code === "string" ? country_code.slice(0, 5) : undefined,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Redis connection timed out")), 15_000),
+      ),
+    ]);
 
-  res.status(202).json({ jobId: job.id, pollUrl: `/jobs/${job.id}` });
+    res.status(202).json({ jobId: job.id, pollUrl: `/jobs/${job.id}` });
+  } catch (err) {
+    res.status(503).json({ error: (err as Error).message || "Service unavailable" });
+  }
 });
 
 /**
