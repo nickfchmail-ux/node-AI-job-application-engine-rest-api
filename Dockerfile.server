@@ -7,5 +7,10 @@ RUN npm ci
 
 COPY . .
 
+# Build TypeScript once — saves memory at runtime
+RUN npx tsc
+
+ENV NODE_OPTIONS="--max-old-space-size=200"
+
 EXPOSE 8080
-CMD ["npx", "ts-node", "src/server.ts"]
+CMD ["node", "dist/server.js"]

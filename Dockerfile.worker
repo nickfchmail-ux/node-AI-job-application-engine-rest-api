@@ -9,4 +9,10 @@ RUN npx playwright install chromium
 
 COPY . .
 
-CMD ["npx", "ts-node", "./src/worker.ts"]
+# Build TypeScript once at build time — saves ~100MB RAM vs ts-node at runtime
+RUN npx tsc
+
+# Limit Node heap to leave room for Chromium (~200MB browser + ~300MB Node = fits in 512MB)
+ENV NODE_OPTIONS="--max-old-space-size=300"
+
+CMD ["node", "dist/worker.js"]
