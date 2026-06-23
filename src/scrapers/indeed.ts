@@ -76,6 +76,10 @@ export class IndeedScraper extends BaseJobScraper {
     if (apiKey) {
       return this.scrapeViaApi(keyword, maxPages, apiKey);
     }
+    this.log(
+      "[Indeed HK] WARNING: No SCRAPERAPI_KEY configured — Indeed blocks datacenter IPs with Cloudflare. " +
+      "Direct browser access will likely fail. Set SCRAPERAPI_KEY in Render env vars to enable Indeed scraping.",
+    );
     return this.scrapeViaBrowser(keyword, maxPages);
   }
 
@@ -123,7 +127,7 @@ export class IndeedScraper extends BaseJobScraper {
     return allJobs;
   }
 
-  /** Original Playwright path — works from residential IPs */
+  /** Original Playwright path — works from residential IPs only */
   private async scrapeViaBrowser(
     keyword: string,
     maxPages: number,
@@ -134,7 +138,7 @@ export class IndeedScraper extends BaseJobScraper {
     try {
       for (let p = 1; p <= maxPages; p++) {
         const url = this.buildUrl(keyword, p);
-        this.log(`[Indeed HK] page ${p}/${maxPages}`);
+        this.log(`[Indeed HK] page ${p}/${maxPages} (direct browser)`);
         const tab = await context.newPage();
 
         try {
@@ -145,11 +149,28 @@ export class IndeedScraper extends BaseJobScraper {
           await tab.waitForTimeout(5000);
 
           const html = await tab.content();
+
+          // Detect Cloudflare / security block early — don't waste time on remaining pages
+          const title = await tab.title();
+          if (
+            title.includes("Security Check") ||
+            title.includes("Attention Required") ||
+            html.includes("Human Verification") ||
+            html.includes("cf-browser-verify") ||
+            html.includes("Just a moment")
+          ) {
+            this.log(
+              `[Indeed HK] ⛔ Cloudflare security block detected (title: "${title}"). ` +
+              `Indeed blocks datacenter IPs. Set SCRAPERAPI_KEY in Render env vars to bypass. ` +
+              `Skipping remaining pages.`,
+            );
+            break;
+          }
+
           const jobs = this.parseMosaicJson(html);
           this.log(`[Indeed HK] Page ${p}: ${jobs.length} jobs`);
 
           if (jobs.length === 0) {
-            const title = await tab.title();
             const bodySnippet = await tab.evaluate(
               () =>
                 document.body?.innerText?.slice(0, 200).replace(/\s+/g, " ") ??
