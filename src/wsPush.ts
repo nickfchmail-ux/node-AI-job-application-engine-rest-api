@@ -17,20 +17,28 @@ import { Server as SocketIOServer, Socket } from "socket.io";
 import { getUserSummary, getRunCounts } from "./queue/upstash";
 
 export function funnelFrom(counts: Record<string, number>) {
+  const scraped = counts.scraped ?? 0;
+  const duplicate = counts.duplicate ?? 0;
+  const unique = Math.max(0, scraped - duplicate);
+  const analysed = counts.analysed ?? 0;
+  const failed = counts.failed ?? 0;
+  const completed = counts.completed ?? 0;
+  // processing = unique jobs not yet analysed/failed (derived, never negative)
+  const processing = Math.max(0, unique - analysed - failed);
   return {
-    scraped: counts.scraped ?? 0,
-    duplicate: counts.duplicate ?? 0,
-    unique: (counts.scraped ?? 0) - (counts.duplicate ?? 0),
-    processing: counts.processing ?? 0,
-    analysed: counts.analysed ?? 0,
+    scraped,
+    duplicate,
+    unique,
+    processing,
+    analysed,
     fit: counts.fit ?? 0,
     unfit: counts.unfit ?? 0,
     cover_letter: counts.cover_letter ?? 0,
     resume_building: counts.resume_building ?? 0,
     resume_done: counts.resume_done ?? 0,
     resume_failed: counts.resume_failed ?? 0,
-    completed: counts.completed ?? 0,
-    failed: counts.failed ?? 0,
+    completed,
+    failed,
   };
 }
 
