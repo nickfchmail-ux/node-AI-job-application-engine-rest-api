@@ -15,6 +15,7 @@
 import { Server as HttpServer } from "http";
 import { Server as SocketIOServer, Socket } from "socket.io";
 import { getUserSummary, getRunCounts } from "./queue/upstash";
+import { getSupabaseClient } from "./db";
 
 export function funnelFrom(counts: Record<string, number>) {
   const scraped = counts.scraped ?? 0;
@@ -51,30 +52,26 @@ export function initWs(server: HttpServer): SocketIOServer {
   });
 
   // ── Auth + room join ─────────────────────────────────────
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
     // Client passes the Supabase JWT as socket.handshake.auth.token
     const token = socket.handshake.auth?.token;
     if (!token || typeof token !== "string") {
       next(new Error("unauthorized: missing token"));
       return;
     }
-    // Lightweight JWT decode (payload only — we just need sub + exp).
-    // Full verification is done via the REST API when fetching stats.
+    // FULL verification via Supabase Auth — prevents a forged token
+    // from joining another user's room.
     try {
-      const payload = token.split(".")[1];
-      const decoded = JSON.parse(Buffer.from(payload, "base64url").toString());
-      if (decoded.exp && decoded.exp * 1000 < Date.now()) {
-        next(new Error("unauthorized: token expired"));
+      const supabase = getSupabaseClient();
+      const { data, error } = await supabase.auth.getUser(token);
+      if (error || !data.user?.id) {
+        next(new Error("unauthorized: invalid token"));
         return;
       }
-      if (!decoded.sub) {
-        next(new Error("unauthorized: no sub"));
-        return;
-      }
-      (socket.data as { userId?: string }).userId = decoded.sub;
+      (socket.data as { userId?: string }).userId = data.user.id;
       next();
     } catch {
-      next(new Error("unauthorized: bad token"));
+      next(new Error("unauthorized: verification failed"));
     }
   });
 
