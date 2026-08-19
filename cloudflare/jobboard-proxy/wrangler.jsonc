@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "jobboard-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1.0,
+  },
+  "kv_namespaces": [
+    {
+      "binding": "JOBBOARD_KV",
+      "id": "<YOUR_KV_NAMESPACE_ID>",
+      "preview_id": "<YOUR_KV_PREVIEW_ID>",
+    },
+  ],
+  "vars": {
+    "ALLOWED_ORIGINS": "",
+  },
+}

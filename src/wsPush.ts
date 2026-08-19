@@ -13,33 +13,21 @@
 // ============================================================
 
 import { Server as HttpServer } from "http";
-import { Server as SocketIOServer, Socket } from "socket.io";
-import { getUserSummary, getRunCounts } from "./queue/upstash";
+import { Socket, Server as SocketIOServer } from "socket.io";
 import { getSupabaseClient } from "./db";
+import { getRunCounts, getUserSummary } from "./queue/upstash";
 
 export function funnelFrom(counts: Record<string, number>) {
   const scraped = counts.scraped ?? 0;
   const duplicate = counts.duplicate ?? 0;
   const unique = Math.max(0, scraped - duplicate);
-  const analysed = counts.analysed ?? 0;
-  const failed = counts.failed ?? 0;
-  const completed = counts.completed ?? 0;
-  // processing = unique jobs not yet analysed/failed (derived, never negative)
-  const processing = Math.max(0, unique - analysed - failed);
+  // processing = live counter incremented/decremented by the job processor
+  const processing = counts.processing ?? 0;
   return {
     scraped,
     duplicate,
     unique,
     processing,
-    analysed,
-    fit: counts.fit ?? 0,
-    unfit: counts.unfit ?? 0,
-    cover_letter: counts.cover_letter ?? 0,
-    resume_building: counts.resume_building ?? 0,
-    resume_done: counts.resume_done ?? 0,
-    resume_failed: counts.resume_failed ?? 0,
-    completed,
-    failed,
   };
 }
 
@@ -101,10 +89,7 @@ export function initWs(server: HttpServer): SocketIOServer {
  * Push a stats update to a user's room.
  * runId is optional — when given, also emits the per-run funnel.
  */
-export async function pushStats(
-  userId: string,
-  runId?: string,
-): Promise<void> {
+export async function pushStats(userId: string, runId?: string): Promise<void> {
   if (!io) return;
   try {
     const [summary, runCounts] = await Promise.all([

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0",
+  "parameters": {
+    "functionAppName": {
+      "value": "jobsautomation-fn"
+    },
+    "serviceBusNamespaceName": {
+      "value": "jobsautomation-sbns"
+    },
+    "location": {
+      "value": "eastasia"
+    },
+    "supabaseUrl": {
+      "value": "https://uqrgivzeklqehuqqqqyv.supabase.co"
+    },
+    "supabaseServiceKey": {
+      "value": "<your-supabase-service-role-key>"
+    },
+    "supabaseAnonKey": {
+      "value": "<your-supabase-anon-key>"
+    },
+    "deepSeekApi": {
+      "value": "<your-deepseek-api-key>"
+    },
+    "azureFunctionWebhookSecret": {
+      "value": "<your-azure-webhook-secret>"
+    },
+    "cloudflareProxyUrl": {
+      "value": "https://jobboard-proxy.nickfchmail.workers.dev"
+    }
+  }
+}

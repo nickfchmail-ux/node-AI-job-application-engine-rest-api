@@ -1,0 +1,29 @@
+{
+  "name": "jobsautomation-functions",
+  "version": "1.0.0",
+  "description": "Azure Functions processing layer for the Jobs Automation platform — scrape API, scraper worker, job processor, and job callback.",
+  "main": "dist/src/functions/*.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "clean": "rimraf dist",
+    "prestart": "npm run clean && npm run build",
+    "start": "func start",
+    "test": "echo \"No tests yet...\""
+  },
+  "dependencies": {
+    "@azure/functions": "4.0.0",
+    "@azure/identity": "^4.5.0",
+    "@azure/service-bus": "^7.9.5",
+    "@supabase/supabase-js": "^2.98.0",
+    "mammoth": "^1.12.1",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^2.4.5",
+    "undici": "5.28.4"
+  },
+  "devDependencies": {
+    "@types/node": "20.x",
+    "rimraf": "^5.0.0",
+    "typescript": "^5.5.0"
+  }
+}

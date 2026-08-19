@@ -1,0 +1,37 @@
+-- ============================================================
+--  0004_database_webhook.sql
+--
+--  Database Webhook → Edge Function → Azure Function
+--
+--  ⚠️  IMPORTANT: Supabase Database Webhooks are configured in
+--  the DASHBOARD, not via SQL into an internal table.
+--  The previous direct `supabase_webhooks` INSERT is NOT
+--  supported and was removed.
+--
+--  ── DO THIS IN THE DASHBOARD ──────────────────────────────
+--  Dashboard → Database → Webhooks → Create webhook:
+--    1. Name:              on-job-changed
+--    2. Table:             jobs
+--    3. Events:            INSERT, UPDATE
+--    4. HTTP Method:       POST
+--    5. URL:
+--         https://<project-ref>.supabase.co/functions/v1/on-job-changed
+--       (or your Azure Function URL directly if preferred)
+--    6. Headers:
+--         x-webhook-secret: <AZURE_FUNCTION_WEBHOOK_SECRET>
+--    7. Body:
+--         {"type":"{{TYPE}}","table":"jobs","schema":"public",
+--          "record":"{{record}}","old_record":"{{old_record}}"}
+--
+--  ── ALTERNATIVE (SQL trigger using pg_net) ────────────────
+--  If you prefer an SQL-based trigger instead of the Dashboard
+--  webhook, enable the pg_net extension and create a trigger
+--  function that calls the Edge Function asynchronously.
+--  See: supabase/webhooks_pg_net.sql for the full example.
+-- ============================================================
+
+-- This migration intentionally contains NO destructive SQL.
+-- Database webhooks must be created via the Dashboard UI.
+-- See supabase/README.md and supabase/webhooks_pg_net.sql.
+SELECT 1;
+

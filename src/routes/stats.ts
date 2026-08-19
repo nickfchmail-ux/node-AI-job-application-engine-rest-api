@@ -29,24 +29,12 @@ function funnelFrom(counts: Record<string, number>) {
   const scraped = counts.scraped ?? 0;
   const duplicate = counts.duplicate ?? 0;
   const unique = Math.max(0, scraped - duplicate);
-  const analysed = counts.analysed ?? 0;
-  const failed = counts.failed ?? 0;
-  const completed = counts.completed ?? 0;
-  const processing = Math.max(0, unique - analysed - failed);
+  const processing = counts.processing ?? 0;
   return {
     scraped,
     duplicate,
     unique,
     processing,
-    analysed,
-    fit: counts.fit ?? 0,
-    unfit: counts.unfit ?? 0,
-    cover_letter: counts.cover_letter ?? 0,
-    resume_building: counts.resume_building ?? 0,
-    resume_done: counts.resume_done ?? 0,
-    resume_failed: counts.resume_failed ?? 0,
-    completed,
-    failed,
   };
 }
 
@@ -105,7 +93,7 @@ router.get("/runs/:runId", async (req: Request, res: Response) => {
       getRunMeta(req.userId!, runId),
     ]);
 
-    // Rebuild a per-board object: { jobsdb: { fit: 2, scraped: 30 }, ... }
+    // Rebuild a per-board object: { jobsdb: { scraped: 30, processing: 2 }, ... }
     const boards: Record<string, Record<string, number>> = {};
     for (const [key, val] of Object.entries(boardCounts)) {
       const sep = key.indexOf(":");

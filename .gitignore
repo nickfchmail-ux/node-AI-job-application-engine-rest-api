@@ -12,3 +12,31 @@ jobstatus.json
 results/
 resume/
 -H
+
+# Azure deployment secrets (never commit)
+.azure/
+*.env.local
+supabase/.temp/
+cloudflare/jobboard-proxy/.dev.vars
+
+# Local tooling config (may contain API keys)
+.deepcode/
+
+# Cloudflare Wrangler local state (never commit)
+cloudflare/jobboard-proxy/.wrangler/
+.wrangler/
+
+# Debug / scratch output (never commit)
+jobs_*.json
+run_*.json
+runs_*.json
+runstatus*.json
+scrape_*.json
+scrape_*.html
+create_user.json
+gd_api.json
+gd_test*.html
+ot_list.html
+supabase_insert.json
+poll.js
+azure/functions/jobsdb_direct.html

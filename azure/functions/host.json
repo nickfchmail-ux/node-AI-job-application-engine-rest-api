@@ -1,0 +1,25 @@
+{
+  "version": "2.0",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "excludedTypes": "Request"
+      }
+    }
+  },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  },
+  "extensions": {
+    "serviceBus": {
+      "maxConcurrentCalls": 16,
+      "prefetchCount": 32,
+      "maxConcurrentSessions": 200,
+      "maxMessageBatchSize": 1000,
+      "minMessageBatchSize": 1,
+      "maxBatchWaitTime": "00:00:10"
+    }
+  }
+}
