@@ -15,7 +15,12 @@
 import { Server as HttpServer } from "http";
 import { Socket, Server as SocketIOServer } from "socket.io";
 import { getSupabaseClient } from "./db";
-import { getRunCounts, getUserSummary } from "./queue/upstash";
+import {
+  getRunBoardCounts,
+  getRunCounts,
+  getUserSummary,
+  listUserRuns,
+} from "./queue/upstash";
 
 export function funnelFrom(counts: Record<string, number>) {
   const scraped = counts.scraped ?? 0;
@@ -29,6 +34,26 @@ export function funnelFrom(counts: Record<string, number>) {
     unique,
     processing,
   };
+}
+
+/**
+ * Group the flat per-board counters hash into a frontend-friendly object:
+ *   { "jobsdb": { scraped, duplicate, unique, processing }, "ctgoodjobs": {...} }
+ * Keys in Redis are like "jobsdb:scraped", "jobsdb:processing", ...
+ */
+export function boardsFrom(boardCounts: Record<string, number>) {
+  const boards: Record<string, { scraped: number; duplicate: number; unique: number; processing: number }> = {};
+  for (const [key, val] of Object.entries(boardCounts)) {
+    const sep = key.indexOf(":");
+    if (sep === -1) continue;
+    const board = key.slice(0, sep);
+    const name = key.slice(sep + 1);
+    if (!boards[board]) boards[board] = { scraped: 0, duplicate: 0, unique: 0, processing: 0 };
+    if (name in boards[board]) boards[board][name as "scraped"] = val;
+  }
+  // ensure unique = scraped - duplicate per board
+  for (const b of Object.values(boards)) b.unique = Math.max(0, b.scraped - b.duplicate);
+  return boards;
 }
 
 let io: SocketIOServer | null = null;
@@ -77,6 +102,31 @@ export function initWs(server: HttpServer): SocketIOServer {
       })
       .catch(() => {});
 
+    // Also push the latest run's per-board breakdown on connect so the
+    // dashboard renders board chips immediately, without waiting for the
+    // next Azure webhook push.
+    listUserRuns(userId)
+      .then((runs) => {
+        const latestId = runs?.[0];
+        if (!latestId) return;
+        return Promise.all([
+          getRunCounts(userId, latestId),
+          getRunBoardCounts(userId, latestId),
+        ]).then(([runCounts, boardCounts]) => {
+          socket.emit("stats:run", {
+            ok: true,
+            runId: latestId,
+            counts: funnelFrom(runCounts),
+          });
+          socket.emit("stats:boards", {
+            ok: true,
+            runId: latestId,
+            boards: boardsFrom(boardCounts),
+          });
+        });
+      })
+      .catch(() => {});
+
     socket.on("disconnect", () => {
       console.log(`[ws] user ${userId} disconnected (socket ${socket.id})`);
     });
@@ -87,14 +137,17 @@ export function initWs(server: HttpServer): SocketIOServer {
 
 /**
  * Push a stats update to a user's room.
- * runId is optional — when given, also emits the per-run funnel.
+ * runId is optional — when given, also emits the per-run funnel AND the
+ * per-board breakdown (stats:boards) so the frontend can show each board's
+ * live state from the socket alone.
  */
 export async function pushStats(userId: string, runId?: string): Promise<void> {
   if (!io) return;
   try {
-    const [summary, runCounts] = await Promise.all([
+    const [summary, runCounts, boardCounts] = await Promise.all([
       getUserSummary(userId),
       runId ? getRunCounts(userId, runId) : Promise.resolve({}),
+      runId ? getRunBoardCounts(userId, runId) : Promise.resolve({}),
     ]);
     io.to(`user:${userId}`).emit("stats:summary", {
       ok: true,
@@ -105,6 +158,12 @@ export async function pushStats(userId: string, runId?: string): Promise<void> {
         ok: true,
         runId,
         counts: funnelFrom(runCounts),
+      });
+      // NEW: per-board live state (each board's scraped/duplicate/unique/processing)
+      io.to(`user:${userId}`).emit("stats:boards", {
+        ok: true,
+        runId,
+        boards: boardsFrom(boardCounts),
       });
     }
   } catch (err) {
