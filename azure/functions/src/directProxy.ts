@@ -67,6 +67,7 @@ export interface DirectProxyResult {
     | "blocked"
     | "challenge"
     | "timeout"
+    | "rate_limited"
     | "upstream"
     | "not_found"
     | "bad_proxy_config";
@@ -170,7 +171,9 @@ export async function fetchBoardDirect(opts: {
       return { ok: false, error: "blocked", status: statusCode };
     }
     if (statusCode === 429) {
-      return { ok: false, error: "blocked", status: statusCode };
+      // DataImpulse rate-limits per IP after a few rapid requests.
+      // Treat as RETRYABLE so the caller backs off and retries.
+      return { ok: false, error: "rate_limited", status: statusCode };
     }
     if (statusCode === 404) {
       return { ok: false, error: "not_found", status: 404 };

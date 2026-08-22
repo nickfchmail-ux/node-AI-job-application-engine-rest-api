@@ -58,22 +58,35 @@ export async function fetchBoardPage(opts: {
   // ── Boards that block datacenter IPs (jobsdb returns 403 to Cloudflare) ──
   // Try the DataImpulse residential proxy FIRST — residential IPs pass
   // anti-bot, whereas the Cloudflare worker's datacenter egress gets 403'd.
+  // DataImpulse rate-limits (429) after a few rapid requests, so retry with
+  // backoff before falling back to the Cloudflare worker.
   const pattern = getBoardPattern(board);
   const dcBlocked = pattern?.antiBot.datacenterBlocked === true;
   if (dcBlocked) {
-    const direct = await fetchBoardDirect({
-      board,
-      keyword,
-      page,
-      countryCode,
-      log,
-    });
-    if (direct.ok && direct.html) {
-      log(`[proxy] ${board} p${page} OK via residential (datacenter-blocked board)`);
-      return { ok: true, html: direct.html };
+    const retryable = ["rate_limited", "timeout", "upstream"];
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const direct = await fetchBoardDirect({
+        board,
+        keyword,
+        page,
+        countryCode,
+        log,
+      });
+      if (direct.ok && direct.html) {
+        log(`[proxy] ${board} p${page} OK via residential (datacenter-blocked board)`);
+        return { ok: true, html: direct.html };
+      }
+      const retry = direct.error && retryable.includes(direct.error);
+      log(
+        `[proxy] ${board} residential attempt ${attempt + 1}/${MAX_ATTEMPTS} got ${direct.error}${direct.detail ? ` ${direct.detail}` : ""}${retry ? " — retrying" : ""}`,
+      );
+      if (!retry) break;
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await new Promise((r) => setTimeout(r, BASE_BACKOFF_MS * 2 ** attempt));
+      }
     }
     log(
-      `[proxy] ${board} residential-first failed (${direct.error}${direct.detail ? ` ${direct.detail}` : ""}) — falling back to Cloudflare worker`,
+      `[proxy] ${board} residential-first failed — falling back to Cloudflare worker`,
     );
   }
 
