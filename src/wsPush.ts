@@ -19,7 +19,6 @@ import {
   getRunBoardCounts,
   getRunCounts,
   getUserSummary,
-  listUserRuns,
 } from "./queue/upstash";
 
 export function funnelFrom(counts: Record<string, number>) {
@@ -105,6 +104,32 @@ async function getRunBoardDetail(
   } catch (err) {
     console.warn(`[ws] getRunBoardDetail(${runId}) failed: ${err}`);
     return { rows: [], requested: [] };
+  }
+}
+
+/**
+ * The user's MOST RECENT run id (from Supabase pipeline_runs, ordered by
+ * created_at desc). This is authoritative + ordered — the Redis SMEMBERS
+ * set is unordered, so we don't rely on it for the "current run".
+ */
+async function getLatestRunId(userId: string): Promise<string | null> {
+  try {
+    const supabase = getSupabaseClient();
+    const { data, error } = await supabase
+      .from("pipeline_runs")
+      .select("id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      console.warn(`[ws] latest run(${userId}) failed: ${error.message}`);
+      return null;
+    }
+    return data?.id ? String(data.id) : null;
+  } catch (err) {
+    console.warn(`[ws] latest run(${userId}) failed: ${err}`);
+    return null;
   }
 }
 
@@ -202,26 +227,25 @@ export function initWs(server: HttpServer): SocketIOServer {
 
     // Also push the latest run's per-board breakdown on connect so the
     // dashboard renders board chips immediately, without waiting for the
-    // next Azure webhook push.
-    listUserRuns(userId)
-      .then((runs) => {
-        const latestId = runs?.[0];
+    // next Azure webhook push. Uses Supabase (ordered by created_at) — NOT
+    // the unordered Redis set — so we always pick the current active run.
+    getLatestRunId(userId)
+      .then(async (latestId) => {
         if (!latestId) return;
-        return Promise.all([
+        const [runCounts, boardCounts, detail] = await Promise.all([
           getRunCounts(userId, latestId),
           getRunBoardCounts(userId, latestId),
           getRunBoardDetail(latestId),
-        ]).then(([runCounts, boardCounts, detail]) => {
-          socket.emit("stats:run", {
-            ok: true,
-            runId: latestId,
-            counts: funnelFrom(runCounts),
-          });
-          socket.emit("stats:boards", {
-            ok: true,
-            runId: latestId,
-            boards: boardsFrom(boardCounts, detail.rows, detail.requested),
-          });
+        ]);
+        socket.emit("stats:run", {
+          ok: true,
+          runId: latestId,
+          counts: funnelFrom(runCounts),
+        });
+        socket.emit("stats:boards", {
+          ok: true,
+          runId: latestId,
+          boards: boardsFrom(boardCounts, detail.rows, detail.requested),
         });
       })
       .catch(() => {});

@@ -149,6 +149,14 @@ function Funnel({ counts }: { counts: Funnel }) {
 > queued → processing → completed), use **Supabase Realtime on `jobs`**
 > (see `docs/FRONTEND_GUIDE.md`). For per-board stages, use Realtime on `run_boards`.
 
+**When does the socket push?** Azure fires the webhook on:
+- every **counter** change (scraped/duplicate/processing), and
+- every **board stage** change (fetching → extracting → done | blocked | failed).
+
+So a board chip goes `Waiting… → Searching… → ✓ Done` live, with no polling.
+The very first push for a new run happens the moment the first board starts
+`fetching` — before that the chips legitimately show `Waiting for status…`.
+
 ---
 
 ## 3b. Render per-board chips (NEW — from `stats:boards`)
@@ -161,6 +169,10 @@ search is done or still processing** — all from the same socket.
 ```tsx
 // Each board chip shows: name, search stage, and live count.
 // stage tells the user if THIS board's search is done or still working.
+// - "Waiting for status…" = we haven't received stats:boards for this run yet
+//   (only happens for the first moment of a brand-new run — Azure pushes
+//   as soon as the first board starts "fetching")
+// - "Waiting…"            = the board is pending (queued, not yet started)
 function BoardChip({ b }: { b: BoardState }) {
   const stageMeta: Record<string, { label: string; cls: string }> = {
     pending:    { label: "Waiting…",       cls: "chip-pending" },
@@ -186,8 +198,12 @@ function BoardChip({ b }: { b: BoardState }) {
   );
 }
 
+// If the socket hasn't delivered stats:boards yet (very first moment of a run),
+// render a neutral placeholder so the user knows we're waiting on the backend:
 function BoardChips({ boards }: { boards: Boards | null }) {
-  if (!boards) return null;
+  if (!boards) {
+    return <div className="board-chips">Waiting for status…</div>;
+  }
   const entries = Object.entries(boards);
   if (entries.length === 0) return null;
 

@@ -137,7 +137,7 @@ export async function incrementCounters(
       await client.pipeline(commands);
       // Fire-and-forget: tell the Express server to push live updates
       // to this user's WebSocket room (no polling on the frontend).
-      notifyWebhook(userId, runId).catch(() => {});
+      notifyStateChange(userId, runId).catch(() => {});
     }
   } catch (err) {
     console.warn(
@@ -147,7 +147,10 @@ export async function incrementCounters(
 }
 
 /** Best-effort: POST to the Express webhook to trigger a WS push. */
-async function notifyWebhook(userId: string, runId: string): Promise<void> {
+export async function notifyStateChange(
+  userId: string,
+  runId: string,
+): Promise<void> {
   if (!STATE_WEBHOOK_URL) return;
   try {
     await fetch(STATE_WEBHOOK_URL, {

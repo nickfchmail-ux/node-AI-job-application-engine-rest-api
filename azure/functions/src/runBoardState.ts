@@ -8,6 +8,7 @@
 // ============================================================
 
 import { getSupabaseClient } from "./supabase";
+import { notifyStateChange } from "./redisState";
 
 export type RunBoardStage =
   | "pending"
@@ -29,6 +30,32 @@ export interface RunBoardPatch {
   retry_count?: number;
   started_at?: string;
   completed_at?: string;
+}
+
+/** Cache runId → userId lookups to avoid hammering Postgres per stage bump. */
+const userIdCache = new Map<string, string>();
+
+/** Resolve the owning user of a run (from pipeline_runs.user_id). */
+async function getRunUserId(runId: string): Promise<string | null> {
+  if (userIdCache.has(runId)) return userIdCache.get(runId) ?? null;
+  try {
+    const supabase = getSupabaseClient();
+    const { data, error } = await supabase
+      .from("pipeline_runs")
+      .select("user_id")
+      .eq("id", runId)
+      .maybeSingle();
+    if (error) {
+      console.warn(`[runBoardState] user lookup(${runId}) failed: ${error.message}`);
+      return null;
+    }
+    const uid = data?.user_id ? String(data.user_id) : null;
+    if (uid) userIdCache.set(runId, uid);
+    return uid;
+  } catch (err) {
+    console.warn(`[runBoardState] user lookup(${runId}) failed: ${err}`);
+    return null;
+  }
 }
 
 /** Ensure a run_boards row exists for (runId, board) — idempotent. */
@@ -69,6 +96,18 @@ export async function updateRunBoard(
     console.warn(
       `[runBoardState] updateRunBoard(${board}) failed: ${error.message}`,
     );
+    return;
+  }
+  // Fire-and-forget: tell the Express server to push the latest
+  // per-board state (stage + counters) to this run's user over the
+  // WebSocket. This is what makes a board's stage change from
+  // "Waiting for status…" → "Searching…" → "✓ Done" LIVE.
+  if (patch.stage) {
+    getRunUserId(runId)
+      .then((uid) => {
+        if (uid) return notifyStateChange(uid, runId);
+      })
+      .catch(() => {});
   }
 }
 
