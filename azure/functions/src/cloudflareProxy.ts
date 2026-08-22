@@ -8,7 +8,7 @@
 //  proxy (see directProxy.ts).
 // ============================================================
 
-import { fetchBoardDirect, fetchDetailDirect } from "./directProxy";
+import { fetchBoardDirect, fetchDetailDirect, DirectProxyResult } from "./directProxy";
 import { fetchViaScraperApi, isScraperApiConfigured } from "./scraperApi";
 import { getBoardPattern } from "./boardRegistry";
 
@@ -59,11 +59,13 @@ export async function fetchBoardPage(opts: {
   // Try the DataImpulse residential proxy FIRST — residential IPs pass
   // anti-bot, whereas the Cloudflare worker's datacenter egress gets 403'd.
   // DataImpulse rate-limits (429) after a few rapid requests, so retry with
-  // backoff before falling back to the Cloudflare worker.
+  // backoff; if residential is exhausted, go STRAIGHT to ScraperAPI (paid
+  // rotating IPs) — skipping the doomed Cloudflare worker (403).
   const pattern = getBoardPattern(board);
   const dcBlocked = pattern?.antiBot.datacenterBlocked === true;
   if (dcBlocked) {
     const retryable = ["rate_limited", "timeout", "upstream"];
+    let lastErr: DirectProxyResult | null = null;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const direct = await fetchBoardDirect({
         board,
@@ -76,15 +78,35 @@ export async function fetchBoardPage(opts: {
         log(`[proxy] ${board} p${page} OK via residential (datacenter-blocked board)`);
         return { ok: true, html: direct.html };
       }
+      lastErr = direct;
       const retry = direct.error && retryable.includes(direct.error);
       log(
         `[proxy] ${board} residential attempt ${attempt + 1}/${MAX_ATTEMPTS} got ${direct.error}${direct.detail ? ` ${direct.detail}` : ""}${retry ? " — retrying" : ""}`,
       );
       if (!retry) break;
       if (attempt < MAX_ATTEMPTS - 1) {
-        await new Promise((r) => setTimeout(r, BASE_BACKOFF_MS * 2 ** attempt));
+        // DataImpulse rate-limit windows can be long — back off harder.
+        await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
       }
     }
+
+    // Residential exhausted → ScraperAPI (rotating IPs) is the reliable
+    // final answer for datacenter-blocked boards. Skip Cloudflare worker.
+    const target = getBoardSearchUrl(board, keyword, page, countryCode);
+    if (target && isScraperApiConfigured()) {
+      log(`[scraperapi] ${board} residential exhausted — trying ScraperAPI...`);
+      const sa = await fetchViaScraperApi({ url: target, countryCode, log });
+      if (sa.ok && sa.html) return { ok: true, html: sa.html };
+      log(
+        `[scraperapi] ${board} ScraperAPI also failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
+      );
+      return {
+        ok: false,
+        error: (sa.error ?? lastErr?.error ?? "upstream") as ProxyFailure["error"],
+        detail: sa.detail ?? lastErr?.detail,
+      };
+    }
+
     log(
       `[proxy] ${board} residential-first failed — falling back to Cloudflare worker`,
     );
