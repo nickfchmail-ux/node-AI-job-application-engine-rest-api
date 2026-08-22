@@ -123,10 +123,7 @@ function htmlToText(html: string): string {
  * Returns null if the element is not found.
  */
 function extractDivById(html: string, id: string): string | null {
-  const openPattern = new RegExp(
-    `<div[^>]+id=["']${id}["'][^>]*>`,
-    "i",
-  );
+  const openPattern = new RegExp(`<div[^>]+id=["']${id}["'][^>]*>`, "i");
   const openMatch = openPattern.exec(html);
   if (!openMatch) return null;
 
@@ -149,7 +146,10 @@ function extractDivById(html: string, id: string): string | null {
     } else {
       depth--;
       if (depth === 0) {
-        return html.slice(openMatch.index + openMatch[0].length, nextClose.index);
+        return html.slice(
+          openMatch.index + openMatch[0].length,
+          nextClose.index,
+        );
       }
       pos = nextClose.index + nextClose[0].length;
     }
@@ -183,30 +183,39 @@ const PLAYWRIGHT_ONLY_HOSTS = ["jobsdb.com", "ctgoodjobs.hk", "indeed.com"];
 async function scrapeDetailFetch(url: string): Promise<JobDetail | null> {
   const hostname = new URL(url).hostname;
 
-  // Indeed detail pages: use ScraperAPI if available, otherwise skip (Cloudflare-blocked)
+  // Indeed detail pages: route through the Cloudflare proxy (no ScraperAPI).
+  // The proxy /indeed/detail mode fetches the job page with realistic headers.
   if (hostname.includes("indeed.com")) {
-    const apiKey = process.env.SCRAPERAPI_KEY;
-    if (!apiKey) {
+    const proxyBase = process.env.CLOUDFLARE_PROXY_URL;
+    if (!proxyBase) {
       return {
         ...EMPTY_DETAIL,
         rawDescription:
-          "[Skipped — Indeed detail pages blocked by Cloudflare; set SCRAPERAPI_KEY]",
+          "[Skipped — Indeed detail pages need the Cloudflare proxy (set CLOUDFLARE_PROXY_URL)]",
       };
     }
     try {
-      const apiUrl = `http://api.scraperapi.com?api_key=${encodeURIComponent(apiKey)}&url=${encodeURIComponent(url)}`;
-      const res = await fetch(apiUrl, {
-        headers: FETCH_HEADERS,
-        signal: AbortSignal.timeout(60000),
+      const proxyUrl = `${proxyBase.replace(/\/$/, "")}/indeed/detail?url=${encodeURIComponent(url)}`;
+      const res = await fetch(proxyUrl, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(30000),
       });
-      if (!res.ok) return { ...EMPTY_DETAIL };
-      const html = await res.text();
+      const body = (await res.json()) as {
+        ok: boolean;
+        html?: string;
+        error?: string;
+      };
+      if (!body.ok || !body.html) return { ...EMPTY_DETAIL };
+      const html = body.html;
       // Indeed embeds the full description in #jobDescriptionText (nested divs)
       const descHtml = extractDivById(html, "jobDescriptionText");
       if (descHtml) {
         const raw = htmlToText(descHtml);
         if (raw.length > 50) {
-          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+          return {
+            ...parseDescription(raw),
+            rawDescription: raw.slice(0, 3000),
+          };
         }
       }
       // Fallback: try broader content selectors
@@ -218,7 +227,10 @@ async function scrapeDetailFetch(url: string): Promise<JobDetail | null> {
       for (const b of blocks) {
         const raw = htmlToText(b[1]);
         if (raw.length > 100) {
-          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+          return {
+            ...parseDescription(raw),
+            rawDescription: raw.slice(0, 3000),
+          };
         }
       }
       return { ...EMPTY_DETAIL };
@@ -243,7 +255,10 @@ async function scrapeDetailFetch(url: string): Promise<JobDetail | null> {
       if (m) {
         const raw = htmlToText(m[1]);
         if (raw.length > 50) {
-          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+          return {
+            ...parseDescription(raw),
+            rawDescription: raw.slice(0, 3000),
+          };
         }
       }
       return { ...EMPTY_DETAIL };
@@ -271,7 +286,10 @@ async function scrapeDetailFetch(url: string): Promise<JobDetail | null> {
       if (descHtml) {
         const raw = htmlToText(descHtml);
         if (raw.length > 50) {
-          return { ...parseDescription(raw), rawDescription: raw.slice(0, 3000) };
+          return {
+            ...parseDescription(raw),
+            rawDescription: raw.slice(0, 3000),
+          };
         }
       }
       return { ...EMPTY_DETAIL };
@@ -388,7 +406,7 @@ export async function enrichOneJob(
   job: Job,
   log: (msg: string) => void = console.log,
 ): Promise<EnrichedJob> {
-  // Fast path: use pre-fetched description from Indeed batch API (0 ScraperAPI credits)
+  // Fast path: use pre-fetched description from Indeed batch API (via proxy, no ScraperAPI)
   if (job.rawDetailHtml) {
     const raw = htmlToText(job.rawDetailHtml);
     if (raw.length > 50) {
@@ -403,7 +421,7 @@ export async function enrichOneJob(
     }
   }
 
-  const FETCH_TIMEOUT_MS = 65_000; // ScraperAPI can take up to 60s
+  const FETCH_TIMEOUT_MS = 65_000; // proxy/upstream can take a while
   const PW_TIMEOUT_MS = 25_000;
 
   // Phase 1: try plain fetch
@@ -446,7 +464,7 @@ export async function enrichJobs(
   jobs: Job[],
   log: (msg: string) => void = console.log,
 ): Promise<EnrichedJob[]> {
-  const FETCH_TIMEOUT_MS = 65_000; // ScraperAPI can take up to 60s
+  const FETCH_TIMEOUT_MS = 65_000; // proxy/upstream can take a while
   const PW_TIMEOUT_MS = 25_000;
   // 1 concurrent Playwright page on Railway free tier (512 MB).
   // Raise to 3-5 on a 2 GB+ container.

@@ -297,6 +297,11 @@ export async function fetchLinkedInDescriptionApi(
 // ── Indeed RPC batch detail endpoint ────────────────────────────────────────
 // GET /rpc/jobdescs?jks=jobkey1,jobkey2 → JSON map jobkey → HTML description.
 // Single call for a whole batch instead of N detail fetches.
+// Routed through the Cloudflare proxy (the /indeed/detail mode) — the SAME
+// path every other board uses. No direct datacenter fetch, no ScraperAPI.
+
+import { fetchViaProxy } from "./cloudflareProxy";
+import { fetchViaScraperApi } from "./scraperApi";
 
 export async function fetchIndeedBatchDescriptionsApi(
   jobkeys: string[],
@@ -305,28 +310,77 @@ export async function fetchIndeedBatchDescriptionsApi(
   if (jobkeys.length === 0) return {};
   const BATCH_SIZE = 25;
   const result: Record<string, string> = {};
+  const proxyBase = process.env.CLOUDFLARE_PROXY_URL;
+
   for (let i = 0; i < jobkeys.length; i += BATCH_SIZE) {
     const batch = jobkeys.slice(i, i + BATCH_SIZE);
     const targetUrl = `https://hk.indeed.com/rpc/jobdescs?jks=${batch.join(",")}`;
+    const chunkNum = i / BATCH_SIZE + 1;
+
+    // If the proxy isn't configured, fall back to a plain fetch (best effort).
+    if (!proxyBase) {
+      log(`[indeed-rpc] CLOUDFLARE_PROXY_URL not set — trying direct fetch`);
+      try {
+        const res = await fetch(targetUrl, {
+          headers: { "User-Agent": UA_CHROME, Accept: "application/json" },
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!res.ok) {
+          log(`[indeed-rpc] chunk ${chunkNum} direct fetch ${res.status}`);
+          continue;
+        }
+        const data = (await res.json()) as Record<string, string>;
+        Object.assign(result, data);
+        log(
+          `[indeed-rpc] chunk ${chunkNum} → ${Object.keys(data).length} descriptions`,
+        );
+      } catch (err) {
+        log(`[indeed-rpc] chunk ${chunkNum} direct error: ${err}`);
+      }
+      continue;
+    }
+
     try {
-      const res = await fetch(targetUrl, {
-        headers: {
-          "User-Agent": UA_CHROME,
-          Accept: "application/json",
-        },
-        signal: AbortSignal.timeout(15_000),
+      const proxyResult = await fetchViaProxy({
+        board: "indeed",
+        url: targetUrl,
+        log,
       });
-      if (!res.ok) {
-        log(`[indeed-rpc] batch ${i / BATCH_SIZE + 1} → HTTP ${res.status}`);
+      if (!proxyResult.ok) {
+        // ── Final fallback: ScraperAPI for the RPC batch ──
+        log(
+          `[indeed-rpc] chunk ${chunkNum} proxy error: ${proxyResult.error} — trying ScraperAPI...`,
+        );
+        const sa = await fetchViaScraperApi({ url: targetUrl, log });
+        if (sa.ok && sa.html) {
+          try {
+            const data = JSON.parse(sa.html) as Record<string, string>;
+            Object.assign(result, data);
+            log(
+              `[indeed-rpc] chunk ${chunkNum} ScraperAPI → ${Object.keys(data).length} descriptions`,
+            );
+          } catch (parseErr) {
+            log(
+              `[indeed-rpc] chunk ${chunkNum} ScraperAPI JSON parse error: ${parseErr}`,
+            );
+          }
+        } else {
+          log(`[indeed-rpc] chunk ${chunkNum} ScraperAPI error: ${sa.error}`);
+        }
         continue;
       }
-      const data = (await res.json()) as Record<string, string>;
-      Object.assign(result, data);
-      log(
-        `[indeed-rpc] batch ${i / BATCH_SIZE + 1} → ${Object.keys(data).length} descriptions`,
-      );
+      // The proxy returns raw HTML (JSON here since the RPC endpoint is JSON).
+      try {
+        const data = JSON.parse(proxyResult.html) as Record<string, string>;
+        Object.assign(result, data);
+        log(
+          `[indeed-rpc] chunk ${chunkNum} → ${Object.keys(data).length} descriptions`,
+        );
+      } catch (parseErr) {
+        log(`[indeed-rpc] chunk ${chunkNum} JSON parse error: ${parseErr}`);
+      }
     } catch (err) {
-      log(`[indeed-rpc] batch ${i / BATCH_SIZE + 1} error: ${err}`);
+      log(`[indeed-rpc] chunk ${chunkNum} error: ${err}`);
     }
   }
   return result;

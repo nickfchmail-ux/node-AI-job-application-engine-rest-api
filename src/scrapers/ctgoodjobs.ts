@@ -1,3 +1,4 @@
+import { fetchUrlViaProxy } from "./proxyFetch";
 import { Job } from "./types";
 
 const BASE_URL = "https://jobs.ctgoodjobs.hk";
@@ -5,18 +6,14 @@ const MAX_PAGES = 5;
 /** Jobs returned per page by CTgoodjobs RSC (observed: 18) */
 const PAGE_SIZE = 18;
 
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-];
-
 interface RscSalary {
   salaryValue?: string;
   salaryFrom?: string | null;
   salaryTo?: string | null;
 }
-interface RscPublishTime { date?: string; }
+interface RscPublishTime {
+  date?: string;
+}
 interface RscJobEntry {
   jobId: string;
   jobTitle: string;
@@ -28,13 +25,13 @@ interface RscJobEntry {
 }
 
 /**
- * CTgoodjobs scraper using plain HTTP fetch + Next.js RSC payload parsing.
+ * CTgoodjobs scraper using the Cloudflare proxy + Next.js RSC payload parsing.
  *
  * CTgoodjobs migrated to Next.js App Router in early 2026. The listing page
  * is now a React Server Components app: the full job data is embedded in the
  * server-rendered HTML inside  self.__next_f.push([1, "..."])  script blocks
- * using the RSC flight protocol. Plain HTTP fetch retrieves this data without
- * a browser. This scraper replaces the old cheerio approach.
+ * using the RSC flight protocol. We fetch through the SAME Cloudflare proxy
+ * the Azure Functions use (no ScraperAPI, no direct datacenter fetches).
  *
  * Implements the same interface that MultiboardScraper expects:
  *   name, log, scrape(keyword, pages)
@@ -48,30 +45,45 @@ export class CTgoodjobsScraper {
   }
 
   private randomUA(): string {
-    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+    const uas = [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    ];
+    return uas[Math.floor(Math.random() * uas.length)];
   }
 
   private async fetchPage(url: string): Promise<string> {
-    const apiKey = process.env.SCRAPERAPI_KEY;
-    const targetUrl = apiKey
-      ? `http://api.scraperapi.com?api_key=${apiKey}&url=${encodeURIComponent(url)}&render=false`
-      : url;
+    // If CLOUDFLARE_PROXY_URL is set, route through the proxy (single path).
+    if (process.env.CLOUDFLARE_PROXY_URL) {
+      try {
+        const html = await fetchUrlViaProxy({
+          board: "ctgoodjobs",
+          url,
+          log: this.log,
+        });
+        this.log(`[${this.name}] ${url} → via proxy OK (${html.length} bytes)`);
+        return html;
+      } catch (err) {
+        this.log(`[${this.name}] proxy fetch failed: ${err}`);
+        throw err;
+      }
+    }
 
-    const headers: Record<string, string> = apiKey
-      ? {} // ScraperAPI sets its own headers
-      : {
-          "User-Agent": this.randomUA(),
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-          "Accept-Encoding": "gzip, deflate, br",
-          Connection: "keep-alive",
-          "Upgrade-Insecure-Requests": "1",
-          "Cache-Control": "max-age=0",
-          Cookie: "culture=en-US",
-        };
+    // Fallback: direct fetch with realistic headers (best effort, no ScraperAPI).
+    const headers: Record<string, string> = {
+      "User-Agent": this.randomUA(),
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, deflate, br",
+      Connection: "keep-alive",
+      "Upgrade-Insecure-Requests": "1",
+      "Cache-Control": "max-age=0",
+      Cookie: "culture=en-US",
+    };
 
-    const resp = await fetch(targetUrl, {
+    const resp = await fetch(url, {
       method: "GET",
       redirect: "follow",
       headers,
@@ -100,27 +112,39 @@ export class CTgoodjobsScraper {
     const rscRegex = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
     let m: RegExpExecArray | null;
     while ((m = rscRegex.exec(html)) !== null) {
-      try { chunks.push(JSON.parse('"' + m[1] + '"')); } catch { /* skip malformed */ }
+      try {
+        chunks.push(JSON.parse('"' + m[1] + '"'));
+      } catch {
+        /* skip malformed */
+      }
     }
     if (chunks.length === 0) return [];
     const fullRsc = chunks.join("\n");
 
     // 2. Parse RSC entries: hexKey:jsonValue (one per line)
     const rscMap = new Map<string, unknown>();
-    const entryRegex = /^([0-9a-f]+):(.+)$/mg;
+    const entryRegex = /^([0-9a-f]+):(.+)$/gm;
     let em: RegExpExecArray | null;
     while ((em = entryRegex.exec(fullRsc)) !== null) {
-      try { rscMap.set(em[1], JSON.parse(em[2])); } catch { /* skip */ }
+      try {
+        rscMap.set(em[1], JSON.parse(em[2]));
+      } catch {
+        /* skip */
+      }
     }
 
     // 3. Find job objects and resolve $ref pointers
     const results: Omit<Job, "source">[] = [];
     for (const [, entry] of rscMap) {
       if (
-        typeof entry !== "object" || entry === null ||
-        !("jobId" in entry) || !("jobTitle" in entry) ||
-        !("url" in entry) || !("companyName" in entry)
-      ) continue;
+        typeof entry !== "object" ||
+        entry === null ||
+        !("jobId" in entry) ||
+        !("jobTitle" in entry) ||
+        !("url" in entry) ||
+        !("companyName" in entry)
+      )
+        continue;
 
       const job = entry as RscJobEntry;
 
@@ -154,7 +178,11 @@ export class CTgoodjobsScraper {
           : null;
       if (locRef) {
         const locArr = rscMap.get(locRef);
-        if (Array.isArray(locArr) && locArr.length > 0 && typeof locArr[0] === "string") {
+        if (
+          Array.isArray(locArr) &&
+          locArr.length > 0 &&
+          typeof locArr[0] === "string"
+        ) {
           location = locArr[0];
         }
       }
@@ -199,7 +227,9 @@ export class CTgoodjobsScraper {
 
     const firstJobs = this.parseRscJobs(html1);
     if (firstJobs.length === 0) {
-      this.log(`[${this.name}] 0 jobs on page 1 — RSC parsing found nothing (possible site change)`);
+      this.log(
+        `[${this.name}] 0 jobs on page 1 — RSC parsing found nothing (possible site change)`,
+      );
       return [];
     }
 

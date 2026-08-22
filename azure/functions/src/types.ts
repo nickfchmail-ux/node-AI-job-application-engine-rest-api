@@ -18,6 +18,32 @@ export interface ScrapedJob {
   rawDetailHtml?: string;
   /** Board key this job came from (jobsdb, ctgoodjobs, indeed, offertoday) */
   board?: string;
+
+  // ── Normalized quality contract (stamped by normalize.applyNormalized) ──
+  // These fields carry the normalized data from the scraper worker through
+  // Service Bus to the job processor, so the frontend gets a CONSISTENT
+  // contract across every board (not just the raw board-shaped fields above).
+  /** Structured salary { display, min, max, period, currency, confidence }. */
+  _normSalary?: {
+    display: string | null;
+    min: number | null;
+    max: number | null;
+    period: "month" | "year" | "hour" | "day" | null;
+    currency: string | null;
+    confidence: "high" | "medium" | "low" | "none";
+  };
+  /** Data-quality signals (completeness + presence flags). */
+  _normDataQuality?: {
+    completeness: number;
+    hasSalary: boolean;
+    hasDescription: boolean;
+    hasPostedDate: boolean;
+    hasLocation: boolean;
+  };
+  /** Deterministic board|url hash — stable id across runs. */
+  _normJobId?: string;
+  /** ISO YYYY-MM-DD posted date (normalized from relative strings). */
+  _normPostedDate?: string;
 }
 
 /** Parsed job detail (from enrichment). */
@@ -128,6 +154,18 @@ export interface JobRow {
   company: string;
   location: string | null;
   salary: string | null;
+  salary_min: number | null;
+  salary_max: number | null;
+  salary_period: string | null;
+  salary_currency: string | null;
+  salary_confidence: string | null;
+  data_quality: {
+    completeness: number;
+    has_salary: boolean;
+    has_description: boolean;
+    has_posted_date: boolean;
+    has_location: boolean;
+  } | null;
   posted_date: string | null;
   url: string;
   short_description: string | null;

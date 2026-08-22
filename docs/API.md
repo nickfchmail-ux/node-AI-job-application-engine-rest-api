@@ -112,7 +112,7 @@ Creates a `pipeline_run`, enqueues the scrape on Service Bus, returns immediatel
 |-------|------|----------|---------|-------|
 | `keyword` | string | ✅ | — | Search keyword |
 | `pages` | number | — | `1` | 1–5 pages per board |
-| `boards` | string[] | — | `["jobsdb","ctgoodjobs"]` | Allowed: `jobsdb`, `ctgoodjobs`, `offertoday`, `linkedin` |
+| `boards` | string[] | — | `["jobsdb","ctgoodjobs"]` | Allowed: `jobsdb`, `ctgoodjobs`, `indeed`, `offertoday`, `linkedin` (all via Cloudflare proxy or public APIs) |
 | `user_id` | string | ✅ | — | Owner UUID (must match the caller's user) |
 | `country_code` | string | — | — | e.g. `hk` |
 

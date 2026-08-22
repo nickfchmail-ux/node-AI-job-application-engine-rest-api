@@ -100,6 +100,52 @@ export async function markRunCompleted(
   });
 }
 
+/**
+ * Check whether every job belonging to a run is in a terminal state
+ * (completed/failed/duplicate). If so, mark the run completed with the
+ * aggregated counters. Idempotent — safe to call after every job finishes.
+ * Returns true when the run was finalized.
+ */
+export async function finalizeRunIfDone(
+  runId: string,
+  log: (msg: string) => void = console.log,
+): Promise<boolean> {
+  const supabase = getSupabaseClient();
+
+  // Count jobs for this run by status
+  const { data, error } = await supabase
+    .from("jobs")
+    .select("status")
+    .eq("pipeline_run_id", runId);
+
+  if (error) {
+    log(
+      `[supabase] finalizeRunIfDone(${runId}) count failed: ${error.message}`,
+    );
+    return false;
+  }
+  if (!data || data.length === 0) return false;
+
+  const terminal = new Set(["completed", "failed", "duplicate"]);
+  const processed = data.filter((r) => r.status === "completed").length;
+  const failed = data.filter((r) => r.status === "failed").length;
+  const duplicate = data.filter((r) => r.status === "duplicate").length;
+
+  const allDone = data.every((r) => terminal.has(r.status));
+  if (!allDone) return false;
+
+  log(
+    `[supabase] finalizeRunIfDone(${runId}) — all ${data.length} jobs terminal (processed=${processed}, failed=${failed}, duplicate=${duplicate})`,
+  );
+  await markRunCompleted(runId, {
+    total: data.length,
+    processed,
+    failed,
+    fit: 0, // scrape-only: no fit analysis
+  });
+  return true;
+}
+
 /** Mark a run failed with an error message. */
 export async function markRunFailed(
   runId: string,

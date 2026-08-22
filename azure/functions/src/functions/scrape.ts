@@ -17,14 +17,27 @@ import { enqueue, ensureQueues } from "../serviceBus";
 import { getSupabaseClient } from "../supabase";
 import type { ScrapeRequestMessage } from "../types";
 
-// Boards that are actively working:
-//   jobsdb      → DataImpulse residential proxy (HTML parse)   ✅
-//   ctgoodjobs  → DataImpulse residential proxy (HTML parse)   ✅
-//   offertoday  → public JSON API (no proxy needed)            ✅
-//   linkedin    → public guest API (no proxy needed)           ✅
-//   indeed      → requires SCRAPERAPI_KEY (paid) — not enabled
-const DEFAULT_BOARDS = ["jobsdb", "ctgoodjobs"];
-const ALLOWED_BOARDS = ["jobsdb", "ctgoodjobs", "offertoday", "linkedin"];
+// Boards that are actively working (all routed through the Cloudflare proxy
+// or public APIs — NO ScraperAPI):
+//   jobsdb      → Cloudflare proxy (residential fallback, HTML parse)   ✅
+//   ctgoodjobs  → Cloudflare proxy (residential fallback, HTML parse)   ✅
+//   offertoday  → public JSON API (no proxy needed)                     ✅
+//   linkedin    → public guest API (no proxy needed)                    ✅
+//   indeed      → Cloudflare proxy (render/anti-bot) + RPC batch detail ✅
+const DEFAULT_BOARDS = [
+  "jobsdb",
+  "ctgoodjobs",
+  "indeed",
+  "offertoday",
+  "linkedin",
+];
+const ALLOWED_BOARDS = [
+  "jobsdb",
+  "ctgoodjobs",
+  "indeed",
+  "offertoday",
+  "linkedin",
+];
 
 app.http("scrape", {
   methods: ["POST"],

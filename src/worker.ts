@@ -75,7 +75,7 @@ async function processScrapeJob(
   const { keyword, pages, force, boards, userId, countryCode } = job.data;
   const log = (msg: string) => {
     console.log(`[job ${job.id}]`, msg);
-    job.log(msg).catch(() => { });
+    job.log(msg).catch(() => {});
   };
 
   const cleanKeyword = keyword
@@ -97,7 +97,9 @@ async function processScrapeJob(
       `Resume profile: ${resumeProfile.currentRole}, ${resumeProfile.yearsOfExperience}y exp, ${resumeProfile.keySkills.length} skills`,
     );
   } catch (err) {
-    log(`⚠ Resume summarization failed: ${err} — falling back to raw resume text`);
+    log(
+      `⚠ Resume summarization failed: ${err} — falling back to raw resume text`,
+    );
     // Build a minimal profile so the pipeline can continue
     resumeProfile = {
       yearsOfExperience: 0,
@@ -147,9 +149,13 @@ async function processScrapeJob(
       query = query.is("user_id", null);
     }
     const { data } = await query;
-    const existingUrls = new Set((data ?? []).map((r: { url: string }) => r.url));
+    const existingUrls = new Set(
+      (data ?? []).map((r: { url: string }) => r.url),
+    );
     const existingTitleCompany = new Set(
-      (data ?? []).map((r: { title: string; company: string }) => `${r.title}|||${r.company}`),
+      (data ?? []).map(
+        (r: { title: string; company: string }) => `${r.title}|||${r.company}`,
+      ),
     );
 
     // const urlSkipped = uniqueJobs.filter((j) => existingUrls.has(j.url));
@@ -164,9 +170,13 @@ async function processScrapeJob(
     );
 
     if (urlSkipped > 0)
-      log(`⏭  ${urlSkipped} job(s) already in Supabase (same URL) — skipping.`);
+      log(
+        `⏭  ${urlSkipped} job(s) already in Supabase (same URL) — skipping.`,
+      );
     if (titleCompanySkipped.length > 0)
-      log(`⏭  ${titleCompanySkipped.length} job(s) already in Supabase (same title+company) — skipping.`);
+      log(
+        `⏭  ${titleCompanySkipped.length} job(s) already in Supabase (same title+company) — skipping.`,
+      );
   }
 
   if (newJobs.length === 0) {
@@ -174,13 +184,13 @@ async function processScrapeJob(
     return { childJobIds: [], totalJobs: 0, keyword: safeKeyword, scrapedDate };
   }
 
-  // 3. Batch-fetch Indeed descriptions (saves ~5 ScraperAPI credits per job)
+  // 3. Batch-fetch Indeed descriptions (via Cloudflare proxy, no ScraperAPI)
   const indeedJobs = newJobs.filter((j) =>
     j.url.includes("indeed.com/viewjob"),
   );
   if (indeedJobs.length > 0) {
     log(
-      `⚡ Batch-fetching ${indeedJobs.length} Indeed description(s) via RPC endpoint...`,
+      `⚡ Batch-fetching ${indeedJobs.length} Indeed description(s) via proxy RPC endpoint...`,
     );
     const jobkeyMap = new Map<string, ScrapedJob>();
     for (const j of indeedJobs) {
@@ -201,10 +211,10 @@ async function processScrapeJob(
         }
       }
       log(
-        `✅ Pre-fetched ${attached}/${indeedJobs.length} Indeed description(s) — saving ~${attached * 5} ScraperAPI credits.`,
+        `✅ Pre-fetched ${attached}/${indeedJobs.length} Indeed description(s).`,
       );
     } catch (err) {
-      log(`⚠ Indeed batch fetch failed (will fallback to ScraperAPI): ${err}`);
+      log(`⚠ Indeed batch fetch failed: ${err}`);
     }
   }
 
@@ -334,11 +344,18 @@ async function tryAcquireProcessingLock(
 
 // ── Phase 2 handler: enrich + analyse + persist ONE job ───────────────────
 async function processOneJob(job: Job<ProcessJobData>) {
-  const { scrapedJob, resumeProfile, safeKeyword, scrapedDate, userId, force, generateCoverLetter } =
-    job.data;
+  const {
+    scrapedJob,
+    resumeProfile,
+    safeKeyword,
+    scrapedDate,
+    userId,
+    force,
+    generateCoverLetter,
+  } = job.data;
   const log = (msg: string) => {
     console.log(`[job ${job.id}]`, msg);
-    job.log(msg).catch(() => { });
+    job.log(msg).catch(() => {});
   };
 
   // 0. Acquire distributed lock to prevent duplicate DeepSeek calls across workers
@@ -374,8 +391,16 @@ async function processOneJob(job: Job<ProcessJobData>) {
       .eq("company", scrapedJob.company)
       .limit(1);
     if (existing && existing.length > 0) {
-      log(`⏭  Skipping "${scrapedJob.title} @ ${scrapedJob.company}" — already exists for this user.`);
-      return { title: scrapedJob.title, company: scrapedJob.company, fit: false, score: 0, skipped: true };
+      log(
+        `⏭  Skipping "${scrapedJob.title} @ ${scrapedJob.company}" — already exists for this user.`,
+      );
+      return {
+        title: scrapedJob.title,
+        company: scrapedJob.company,
+        fit: false,
+        score: 0,
+        skipped: true,
+      };
     }
   }
 
@@ -385,7 +410,11 @@ async function processOneJob(job: Job<ProcessJobData>) {
 
   // 3. Analyse
   log(`Analysing fit with DeepSeek...`);
-  const analysis = await analyzeOne(resumeProfile, enriched, generateCoverLetter);
+  const analysis = await analyzeOne(
+    resumeProfile,
+    enriched,
+    generateCoverLetter,
+  );
   const analysed = { ...enriched, fitAnalysis: analysis };
   const tag = analysis.fit
     ? `✅ FIT (${analysis.score})`
@@ -403,8 +432,16 @@ async function processOneJob(job: Job<ProcessJobData>) {
       .eq("company", analysed.company)
       .limit(1);
     if (existing && existing.length > 0) {
-      log(`⏭  "${analysed.title} @ ${analysed.company}" already in Supabase — skipping insert.`);
-      return { title: analysed.title, company: analysed.company, fit: analysis.fit, score: analysis.score, skipped: true };
+      log(
+        `⏭  "${analysed.title} @ ${analysed.company}" already in Supabase — skipping insert.`,
+      );
+      return {
+        title: analysed.title,
+        company: analysed.company,
+        fit: analysis.fit,
+        score: analysis.score,
+        skipped: true,
+      };
     }
   }
   await upsertToSupabase([analysed], safeKeyword, scrapedDate, log, userId);
@@ -427,7 +464,9 @@ async function processJob(job: Job<PipelineJobData>) {
   if (data.type === "process-job") {
     return await processOneJob(job as Job<ProcessJobData>);
   }
-  throw new Error(`Unknown job type: ${(data as Record<string, unknown>).type}`);
+  throw new Error(
+    `Unknown job type: ${(data as Record<string, unknown>).type}`,
+  );
 }
 
 let worker: Worker | undefined;
@@ -461,7 +500,10 @@ try {
   });
 
   worker.on("failed", (job, err) => {
-    console.error(`[worker] job ${job?.id} (${job?.data.type}) failed:`, err.message);
+    console.error(
+      `[worker] job ${job?.id} (${job?.data.type}) failed:`,
+      err.message,
+    );
   });
 
   worker.on("error", (err) => {

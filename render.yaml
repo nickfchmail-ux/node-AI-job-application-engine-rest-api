@@ -1,5 +1,7 @@
 services:
   # ── API Server ────────────────────────────────────────────────────────────
+  # Serves /auth, /scrape (legacy), /stats/* and the WebSocket live-push.
+  # Reads live funnel counters from Upstash Redis (KV_REST_API_URL).
   - type: web
     name: ai-job-server
     env: docker
@@ -13,20 +15,27 @@ services:
       - key: PORT
         value: 8080
       # Set these secrets in Render dashboard → Environment
-      - key: REDIS_URL
-        sync: false
       - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
+      - key: SUPABASE_SERVICE_KEY
         sync: false
-      - key: JWT_SECRET
+      - key: SUPABASE_ANON_KEY
         sync: false
-      - key: DEEP_SEEK_API
+      # Upstash Redis (user-keyed funnel counters written by Azure Functions)
+      - key: KV_REST_API_URL
         sync: false
-      - key: SCRAPERAPI_KEY
+      - key: KV_REST_API_TOKEN
+        sync: false
+      # Shared secret that Azure Functions send on POST /webhook/state
+      - key: STATE_WEBHOOK_SECRET
+        sync: false
+      # Legacy BullMQ path (optional — REDIS_URL + Cloudflare proxy)
+      - key: REDIS_URL
+        sync: false
+      - key: CLOUDFLARE_PROXY_URL
         sync: false
 
-  # ── Worker 1 ─────────────────────────────────────────────────────────────
+  # ── Worker 1 (legacy BullMQ path, optional) ──────────────────────────────
   - type: web
     name: ai-job-worker-1
     env: docker
@@ -41,18 +50,20 @@ services:
         value: 8080
       - key: WORKER_CONCURRENCY
         value: 1
-      - key: REDIS_URL
-        sync: false
       - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: REDIS_URL
         sync: false
       - key: DEEP_SEEK_API
         sync: false
-      - key: SCRAPERAPI_KEY
+      - key: CLOUDFLARE_PROXY_URL
         sync: false
 
-  # ── Worker 2 ─────────────────────────────────────────────────────────────
+  # ── Worker 2 (legacy BullMQ path, optional) ──────────────────────────────
   - type: web
     name: ai-job-worker-2
     env: docker
@@ -67,13 +78,15 @@ services:
         value: 8080
       - key: WORKER_CONCURRENCY
         value: 1
-      - key: REDIS_URL
-        sync: false
       - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: REDIS_URL
         sync: false
       - key: DEEP_SEEK_API
         sync: false
-      - key: SCRAPERAPI_KEY
+      - key: CLOUDFLARE_PROXY_URL
         sync: false

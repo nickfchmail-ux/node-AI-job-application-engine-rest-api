@@ -23,7 +23,7 @@ SHARED_VARS=(
   "SUPABASE_URL"
   "SUPABASE_SERVICE_KEY"
   "SUPABASE_ANON_KEY"
-  "DEEPSEEK_API_KEY"
+  "DEEP_SEEK_API"
   "JWT_SECRET"
 )
 
@@ -83,7 +83,7 @@ echo ""
 echo "For each service (api-server, worker-1, worker-2, worker-3), run:"
 echo ""
 echo '  railway link --service <service-name>'
-echo '  railway variables set SUPABASE_URL="..." SUPABASE_SERVICE_KEY="..." SUPABASE_ANON_KEY="..." DEEPSEEK_API_KEY="..." JWT_SECRET="..."'
+echo '  railway variables set SUPABASE_URL="..." SUPABASE_SERVICE_KEY="..." SUPABASE_ANON_KEY="..." DEEP_SEEK_API="..." JWT_SECRET="..."'
 echo ""
 echo "For REDIS_URL, use Railway variable references so each service"
 echo "automatically gets the internal Redis URL:"
@@ -101,7 +101,7 @@ cat << 'HELPER'
       SUPABASE_URL="<your-url>" \
       SUPABASE_SERVICE_KEY="<your-key>" \
       SUPABASE_ANON_KEY="<your-anon-key>" \
-      DEEPSEEK_API_KEY="<your-key>" \
+      DEEP_SEEK_API="<your-key>" \
       JWT_SECRET="<your-secret>"
   done
 HELPER

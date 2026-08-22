@@ -190,24 +190,87 @@ All `/stats/*` endpoints require **`Authorization: Bearer <user JWT>`** and are 
 }
 ```
 
-### `GET /stats/runs/:runId` — single run detail (funnel + per-board breakdown)
+### `GET /api/runs/{runId}` — single run detail (status + per-board progress)
+
+**Auth:** `x-functions-key: <key>` (or `?code=<key>`).
 
 **Response `200`**
 
 ```json
 {
-  "ok": true,
-  "runId": "07b0cadf-...",
-  "meta": { "keyword": "...", "boards": [...], "createdAt": "..." },
-  "counts": { "scraped": 62, "...": "funnel shape" },
+  "run": {
+    "id": "07b0cadf-...",
+    "keyword": "react developer",
+    "boards": ["jobsdb", "ctgoodjobs", "offertoday", "linkedin"],
+    "status": "processing",
+    "total_jobs": 34,
+    "processed_jobs": 12,
+    "failed_jobs": 1,
+    "started_at": "2026-08-19T...",
+    "completed_at": null
+  },
+  "jobsCount": 34,
   "boards": {
-    "jobsdb":     { "scraped": 30, "processing": 2 },
-    "ctgoodjobs": { "scraped": 16, "processing": 1 },
-    "offertoday": { "scraped": 10, "processing": 0 },
-    "linkedin":   { "scraped": 9,  "processing": 1 }
-  }
+    "jobsdb": {
+      "stage": "done",
+      "pagesFetched": 1,
+      "pagesTotal": 1,
+      "jobsFound": 18,
+      "jobsProcessed": 10,
+      "jobsFailed": 0,
+      "duplicate": 2,
+      "displayName": "JobsDB HK"
+    },
+    "ctgoodjobs": {
+      "stage": "extracting",
+      "pagesFetched": 1,
+      "pagesTotal": 1,
+      "jobsFound": 12,
+      "jobsProcessed": 2,
+      "jobsFailed": 0,
+      "duplicate": 0,
+      "displayName": "CTgoodjobs HK"
+    },
+    "offertoday": {
+      "stage": "done",
+      "pagesFetched": 1,
+      "pagesTotal": 1,
+      "jobsFound": 30,
+      "jobsProcessed": 0,
+      "jobsFailed": 0,
+      "duplicate": 0,
+      "displayName": "Offer Today"
+    },
+    "linkedin": {
+      "stage": "blocked",
+      "pagesFetched": 0,
+      "pagesTotal": 1,
+      "jobsFound": 0,
+      "jobsProcessed": 0,
+      "jobsFailed": 0,
+      "duplicate": 0,
+      "lastError": "board linkedin page 1: blocked (Cloudflare challenge)",
+      "displayName": "LinkedIn HK"
+    }
+  },
+  "statusLabel": "Loading job details…"
 }
 ```
+
+### Board stages (`boards.<key>.stage`)
+
+| Stage        | Meaning                                         | UI copy (per UX spec) |
+| ------------ | ----------------------------------------------- | --------------------- |
+| `pending`    | Not started yet                                 | "Waiting…"            |
+| `fetching`   | Fetching search pages (proxy / public API)      | "Searching…"          |
+| `extracting` | Parsing listings into job cards                 | "Reading listings…"   |
+| `blocked`    | Anti-bot / proxy blocked this board (retryable) | "Blocked — retrying…" |
+| `done`       | Listings extracted successfully                 | "Done ✓"              |
+| `failed`     | Board failed this run                           | "Failed — retry"      |
+
+> This endpoint streams live via **Supabase Realtime on `run_boards`** — subscribe
+> to `postgres_changes` on `run_boards` filtered by `run_id` (or via the Express
+> WebSocket push, which already forwards `pipeline_runs` + `jobs` changes).
 
 ### Counter semantics (the funnel)
 
@@ -307,6 +370,18 @@ supabase.auth.setSession({ access_token, refresh_token });
 | `last_error` | Error detail when failed |
 | `user_id` | Owner (RLS) |
 
+**`run_boards`** — per-board progress for a run (NEW)
+| Column | Notes |
+|--------|-------|
+| `run_id` | FK → `pipeline_runs.id` |
+| `board_key` | `jobsdb` / `ctgoodjobs` / `offertoday` / `linkedin` / `indeed` |
+| `stage` | `pending → fetching → extracting → done / blocked / failed` |
+| `pages_fetched`, `pages_total` | Search-page progress |
+| `jobs_found`, `jobs_processed`, `jobs_failed`, `duplicate` | Per-board funnel |
+| `last_error`, `retry_count` | Failure detail |
+| `started_at`, `completed_at` | Stage timing |
+| `UNIQUE(run_id, board_key)` | One row per board per run |
+
 > The `generated_resumes` table exists for backwards compatibility but is **not used** by the scrape-only pipeline.
 
 ### Realtime subscriptions (zero-poll live rows)
@@ -333,6 +408,16 @@ supabase
     (payload) => console.log("Run changed:", payload.new),
   )
   .subscribe();
+
+// Live per-board progress (NEW)
+supabase
+  .channel("run_boards")
+  .on(
+    "postgres_changes",
+    { event: "*", schema: "public", table: "run_boards" },
+    (payload) => console.log("Board changed:", payload.new),
+  )
+  .subscribe();
 ```
 
 > **Realtime + RLS:** Supabase Realtime enforces RLS — users only receive changes for their OWN rows. No extra filtering needed.
@@ -341,7 +426,7 @@ supabase
 
 ## 6. Job Processing Status (Azure Function — REST fallback)
 
-### `GET /api/runs/{runId}` — run status + job count
+### `GET /api/runs/{runId}` — run status + job count + per-board progress
 
 **Auth:** `x-functions-key: <function key>`
 
@@ -351,7 +436,11 @@ supabase
 {
   "run": { "id": "...", "status": "processing", "keyword": "...", "..." },
   "jobsCount": 62,
-  "statusLabel": "Processing jobs..."
+  "boards": {
+    "jobsdb":     { "stage": "done", "jobsFound": 30, "jobsProcessed": 20, "jobsFailed": 0, "duplicate": 4, "pagesFetched": 1, "pagesTotal": 1, "displayName": "JobsDB HK" },
+    "ctgoodjobs": { "stage": "extracting", "jobsFound": 16, "jobsProcessed": 8, "jobsFailed": 0, "duplicate": 0, "pagesFetched": 1, "pagesTotal": 1, "displayName": "CTgoodjobs HK" }
+  },
+  "statusLabel": "Loading job details…"
 }
 ```
 
@@ -360,6 +449,42 @@ supabase
 ## 7. Webhook (Internal — do NOT call from frontend)
 
 `POST /webhook/state` — called by **Azure Functions** after updating Redis, to trigger the WebSocket push. Protected by `x-webhook-secret`. **Frontend should not call this** — it's documented for completeness only.
+
+---
+
+## 7b. Normalized Job Data Contract (quality layer)
+
+Every job stored in `jobs` is **normalized from its board's raw output** before
+fan-out (see `azure/functions/src/normalize.ts`). The frontend can therefore
+render any job card without branching on `board`.
+
+| Field                                                       | Type            | Notes                                                                                |
+| ----------------------------------------------------------- | --------------- | ------------------------------------------------------------------------------------ |
+| `title`                                                     | string          | HTML entities decoded, tags stripped, whitespace collapsed                           |
+| `company`                                                   | string          | Same cleaning; `"N/A"`/missing → `"Unknown Company"` (consistent across boards)      |
+| `location`                                                  | string          | Defaults `"Hong Kong"` when a board omits it                                         |
+| `salary`                                                    | string \| null  | Original display string (e.g. `"HK$30,000 – HK$40,000 per month"`)                   |
+| `salary_min` / `salary_max`                                 | integer \| null | Parsed numeric range (sortable/filterable)                                           |
+| `salary_period`                                             | string \| null  | `month` / `year` / `hour` / `day`                                                    |
+| `salary_currency`                                           | string \| null  | ISO 4217 (`HKD`, `USD`, ...) — inferred from board when the raw string has no symbol |
+| `salary_confidence`                                         | string \| null  | `high` / `medium` / `low` / `none`                                                   |
+| `data_quality`                                              | jsonb \| null   | `{ completeness, has_salary, has_description, has_posted_date, has_location }`       |
+| `posted_date`                                               | string \| null  | **ISO `YYYY-MM-DD`** — relative strings (`3d ago`, `Today`) converted                |
+| `url`                                                       | string          | Stable, deduped (unique per run)                                                     |
+| `short_description`                                         | string \| null  | Listing snippet (cleaned)                                                            |
+| `responsibilities` / `requirements` / `benefits` / `skills` | jsonb           | Parsed from the full detail page                                                     |
+| `board`                                                     | string          | `jobsdb` / `ctgoodjobs` / `offertoday` / `linkedin`                                  |
+
+**Data-quality signals** (computed at normalize time, useful for UI badges):
+
+- `posted_date` is **null** when a board only says `"Promoted"` or is unparseable — treat as "date unknown", not "today".
+- A job with `title`, `company`, `location`, and `url` is `completeness: 100`.
+- Salary is **structured** (min/max/period/currency) — no client-side regex needed. `currency` is inferred as `HKD` for HK boards (e.g. Indeed's numeric-only ranges). Missing salary → `salary: null`, `salary_confidence: "none"`.
+
+> **Consistency guarantee:** because normalization happens in the scraper worker
+> BEFORE a job is written, every `jobs` row already carries the clean shape above —
+> no frontend-side regex for entities, dates, or salary is needed. Every board
+> (jobsdb, ctgoodjobs, indeed, linkedin, offertoday) returns the SAME contract.
 
 ---
 
@@ -397,7 +522,7 @@ funnel counters.
 
 ### Notes
 
-- **Boards supported:** `jobsdb`, `ctgoodjobs`, `offertoday`, `linkedin` (Indeed requires a paid ScraperAPI and is disabled).
+- **Boards supported:** `jobsdb`, `ctgoodjobs`, `offertoday`, `linkedin`, `indeed` — all routed through the **Cloudflare proxy** (or the boards' public APIs for OfferToday/LinkedIn). No ScraperAPI.
 - **Per-user isolation:** RLS on all Supabase tables + user-keyed Redis + verified WebSocket auth → a user can only ever see their own jobs, runs, and counters.
 - **No AI / no resume:** the pipeline is scrape-only. `fit`, `fit_score`, `cover_letter`, and resume fields are always `NULL`. No resume upload needed.
 - **Error handling:** check `pipeline_runs.last_error` (run failures) and `jobs.status = failed` (per-job failures).

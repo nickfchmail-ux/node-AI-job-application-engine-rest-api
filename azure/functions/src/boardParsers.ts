@@ -60,12 +60,16 @@ function parseJobsDbHtml(html: string, board: string): ScrapedJob[] {
   const results: ScrapedJob[] = [];
 
   // ── Primary: DOM parsing of <article data-job-id="..."> cards ──
+  // The regex matches the card's <article> open tag (capturing the whole open
+  // tag in group 1) then captures the card BODY in group 2, then the closing
+  // </article>. This is robust to either attribute order on the open tag.
   const cardRegex =
-    /<article[^>]*(?:data-job-id="(\d+)"[^>]*data-automation="normalJob"|data-automation="normalJob"[^>]*data-job-id="(\d+)")[^>]*>([\s\S]*?)<\/article>/gi;
+    /<article\b[^>]*(?:data-job-id="(\d+)"[^>]*data-automation="normalJob"|data-automation="normalJob"[^>]*data-job-id="(\d+)")[^>]*>([\s\S]*?)<\/article>/gi;
   let m: RegExpExecArray | null;
   while ((m = cardRegex.exec(html)) !== null) {
     const jobId = m[1] ?? m[2];
     const card = m[3];
+    if (card == null) continue; // safety: never deref undefined
 
     // Title: aria-label is most reliable; fall back to jobTitle automation
     let title =
@@ -324,34 +328,78 @@ function parseIndeedHtml(html: string, board: string): ScrapedJob[] {
   return [];
 }
 
-// ── OfferToday: regex extraction from HTML ──────────────────────────────────
+// ── OfferToday: regex extraction from HTML (proxy fallback) ─────────────────
+// Used ONLY when the public JSON API is blocked/empty. Mirrors the fields the
+// API path returns (title, company, location, salary, postedDate, description)
+// so the frontend gets the SAME contract regardless of which path succeeded.
+
+/** Try to read the text of the first element matching a selector-ish regex. */
+function offerTodayText(card: string, patterns: RegExp[]): string | undefined {
+  for (const re of patterns) {
+    const m = card.match(re);
+    if (m?.[1]) {
+      const txt = m[1]
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (txt) return txt;
+    }
+  }
+  return undefined;
+}
 
 function parseOfferTodayHtml(html: string, board: string): ScrapedJob[] {
-  // Look for job cards. OfferToday uses <article> / <a> with job titles & links.
   const results: ScrapedJob[] = [];
+
+  // Match job-card anchors: /hk/job/{id} (and older /job/{id} /career paths).
   const cardRegex =
-    /<a[^>]*href="(\/[^"]*(?:job|career)[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+    /<a[^>]*href="(\/[^"]*\/(?:job|career)\/[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
   let m: RegExpExecArray | null;
   while ((m = cardRegex.exec(html)) !== null) {
     const href = m[1];
-    const inner = m[2]
+    const card = m[2];
+    const inner = card
       .replace(/<[^>]+>/g, " ")
       .replace(/\s+/g, " ")
       .trim();
     if (!inner || inner.length < 5) continue;
 
-    // Try to separate title from company — split on common separators
-    const parts = inner
-      .split(/[–—|·•]/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const title = parts[0] ?? inner;
-    const company = parts[1] ?? "N/A";
+    // Title/company: prefer structured elements when present, else split text.
+    const title =
+      offerTodayText(card, [
+        /(?:class|data-[a-z-]*)=["'][^"']*job(?:-|_)?(?:name|title)[^"']*["'][^>]*>([\s\S]*?)<\//i,
+        /<h\d[^>]*>([\s\S]*?)<\/h\d>/i,
+      ]) ??
+      inner.split(/[–—|·•]/)[0]?.trim() ??
+      inner;
+    const company =
+      offerTodayText(card, [
+        /(?:class|data-[a-z-]*)=["'][^"']*(?:company|brand)[^"']*["'][^>]*>([\s\S]*?)<\//i,
+      ]) ??
+      inner.split(/[–—|·•]/)[1]?.trim() ??
+      "";
 
+    // Optional structured fields — best-effort, absent if not in the markup.
+    const salary = offerTodayText(card, [
+      /(?:class|data-[a-z-]*)=["'][^"']*salary[^"']*["'][^>]*>([\s\S]*?)<\//i,
+    ]);
+    const postedDateRaw = offerTodayText(card, [
+      /(?:class|data-[a-z-]*)=["'][^"']*(?:date|time|post)[^"']*["'][^>]*>([\s\S]*?)<\//i,
+      /<time[^>]*>([\s\S]*?)<\/time>/i,
+    ]);
+    const description = offerTodayText(card, [
+      /(?:class|data-[a-z-]*)=["'][^"']*(?:job(?:-|_)?(?:desc|teaser|summary)|short(?:-|_)?desc)[^"']*["'][^>]*>([\s\S]*?)<\//i,
+    ]);
+
+    // Do NOT emit literal "N/A" — the normalizer maps empty/missing to the
+    // SAME fallback ("Unknown Company") across every board.
     results.push({
       title,
       company,
       location: "Hong Kong",
+      salary,
+      postedDate: postedDateRaw,
+      description,
       url: `https://www.offertoday.com${href.startsWith("/") ? href : `/${href}`}`,
       source: "offertoday",
       board,
@@ -365,8 +413,11 @@ function parseOfferTodayHtml(html: string, board: string): ScrapedJob[] {
 /**
  * Extract job listings from raw board HTML.
  * Returns an empty array when nothing parseable is found.
+ * Defensive: returns [] for undefined/null/non-string input so a proxy error
+ * response ({ ok:false, html:undefined }) can never crash the pipeline.
  */
 export function extractListings(board: string, html: string): ScrapedJob[] {
+  if (typeof html !== "string" || html.length === 0) return [];
   switch (board) {
     case "jobsdb":
       return parseJobsDbHtml(html, board);

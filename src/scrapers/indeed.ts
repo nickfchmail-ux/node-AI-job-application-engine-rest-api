@@ -1,13 +1,14 @@
 import { type Page } from "playwright";
 import { browserPool } from "../pipeline/browserPool";
 import { BaseJobScraper } from "./base";
+import { fetchBoardPageViaProxy, fetchUrlViaProxy } from "./proxyFetch";
 import { Job } from "./types";
 
 /**
  * Batch-fetch full job descriptions from Indeed's internal RPC endpoint.
  * Returns a map of jobkey → HTML description string.
- * Tries direct fetch first; if blocked (403), falls back to ScraperAPI proxy
- * (still just 1 API call for all jobs instead of N individual calls).
+ * Routed through the Cloudflare proxy (single call for the whole batch
+ * instead of N per-job detail fetches). No ScraperAPI.
  */
 export async function fetchIndeedBatchDescriptions(
   jobkeys: string[],
@@ -16,94 +17,101 @@ export async function fetchIndeedBatchDescriptions(
   if (jobkeys.length === 0) return {};
   const BATCH_SIZE = 25;
   const result: Record<string, string> = {};
-  const apiKey = process.env.SCRAPERAPI_KEY;
+  const proxyBase = process.env.CLOUDFLARE_PROXY_URL;
 
   for (let i = 0; i < jobkeys.length; i += BATCH_SIZE) {
     const batch = jobkeys.slice(i, i + BATCH_SIZE);
     const targetUrl = `https://hk.indeed.com/rpc/jobdescs?jks=${batch.join(",")}`;
     const chunkNum = i / BATCH_SIZE + 1;
-    const headers = {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      Accept: "application/json",
-    };
 
-    try {
-      // Attempt 1: direct fetch (free, 0 credits)
-      let res = await fetch(targetUrl, {
-        headers,
-        signal: AbortSignal.timeout(15_000),
-      });
-
-      // Attempt 2: if direct blocked, proxy through ScraperAPI (1 credit for whole batch)
-      if (!res.ok && apiKey) {
-        log(`[Indeed batch] chunk ${chunkNum} direct fetch ${res.status}, retrying via ScraperAPI...`);
-        const proxyUrl = `http://api.scraperapi.com?api_key=${encodeURIComponent(apiKey)}&url=${encodeURIComponent(targetUrl)}`;
-        res = await fetch(proxyUrl, {
-          headers,
-          signal: AbortSignal.timeout(60_000),
+    // Primary: route through the Cloudflare proxy (same path as Azure).
+    if (proxyBase) {
+      try {
+        const html = await fetchUrlViaProxy({
+          board: "indeed",
+          url: targetUrl,
+          log,
         });
-      }
-
-      if (!res.ok) {
-        log(`[Indeed batch] chunk ${chunkNum} failed: ${res.status}`);
+        const data = JSON.parse(html) as Record<string, string>;
+        Object.assign(result, data);
+        log(
+          `[Indeed batch] chunk ${chunkNum}: got ${Object.keys(data).length} descriptions`,
+        );
+        continue;
+      } catch (err) {
+        log(`[Indeed batch] chunk ${chunkNum} proxy error: ${err}`);
         continue;
       }
-      const data = await res.json() as Record<string, string>;
+    }
+
+    // Fallback: direct fetch (best effort, 0 credits).
+    try {
+      const res = await fetch(targetUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          Accept: "application/json",
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        log(`[Indeed batch] chunk ${chunkNum} direct fetch ${res.status}`);
+        continue;
+      }
+      const data = (await res.json()) as Record<string, string>;
       Object.assign(result, data);
-      log(`[Indeed batch] chunk ${chunkNum}: got ${Object.keys(data).length} descriptions`);
+      log(
+        `[Indeed batch] chunk ${chunkNum}: got ${Object.keys(data).length} descriptions`,
+      );
     } catch (err) {
-      log(`[Indeed batch] chunk ${chunkNum} error: ${err}`);
+      log(`[Indeed batch] chunk ${chunkNum} direct error: ${err}`);
     }
   }
   return result;
 }
 
-// When SCRAPERAPI_KEY is set, uses ScraperAPI HTTP API with render=true to
-// fetch JS-rendered HTML, bypassing Cloudflare without needing Playwright.
-// Without the key, falls back to the shared browserPool (residential IPs only).
+// All Indeed fetches route through the Cloudflare proxy (the same one the
+// Azure Functions use). If the proxy isn't configured, falls back to the
+// shared browserPool (residential IPs only). No ScraperAPI.
 export class IndeedScraper extends BaseJobScraper {
   readonly name = "Indeed HK";
   readonly baseUrl = "https://hk.indeed.com";
-  /** Optional ScraperAPI geotargeting country code (e.g. "us", "hk"). Costs 10x credits when set. */
+  /** Optional geotargeting country code (e.g. "us", "hk"). */
   countryCode?: string;
 
   async scrape(keyword: string, pages = 0): Promise<Job[]> {
     const maxPages = Math.min(pages || this.MAX_PAGES, this.MAX_PAGES);
-    const apiKey = process.env.SCRAPERAPI_KEY;
 
-    if (apiKey) {
-      return this.scrapeViaApi(keyword, maxPages, apiKey);
+    if (process.env.CLOUDFLARE_PROXY_URL) {
+      return this.scrapeViaProxy(keyword, maxPages);
     }
     this.log(
-      "[Indeed HK] WARNING: No SCRAPERAPI_KEY configured — Indeed blocks datacenter IPs with Cloudflare. " +
-      "Direct browser access will likely fail. Set SCRAPERAPI_KEY in Render env vars to enable Indeed scraping.",
+      "[Indeed HK] CLOUDFLARE_PROXY_URL not set — falling back to direct browser (residential IPs only).",
     );
     return this.scrapeViaBrowser(keyword, maxPages);
   }
 
-  /** Use ScraperAPI HTTP API with render=true to get JS-rendered HTML */
-  private async scrapeViaApi(
+  /** Fetch Indeed search pages through the Cloudflare proxy (no JS render needed — mosaic JSON is in the SSR HTML). */
+  private async scrapeViaProxy(
     keyword: string,
     maxPages: number,
-    apiKey: string,
   ): Promise<Job[]> {
-    this.log("[Indeed HK] Using ScraperAPI render mode");
+    this.log("[Indeed HK] Using Cloudflare proxy");
     const allJobs: Job[] = [];
 
     for (let p = 1; p <= maxPages; p++) {
       const targetUrl = this.buildUrl(keyword, p);
-      const cc = this.countryCode ? `&country_code=${encodeURIComponent(this.countryCode)}` : '';
-      const apiUrl = `http://api.scraperapi.com?api_key=${encodeURIComponent(apiKey)}&url=${encodeURIComponent(targetUrl)}${cc}`;
-      this.log(`[Indeed HK] page ${p}/${maxPages}`);
+      this.log(`[Indeed HK] page ${p}/${maxPages} (via proxy)`);
 
       try {
-        const res = await fetch(apiUrl, { signal: AbortSignal.timeout(60000) });
-        this.log(`[Indeed HK] ${targetUrl} → ${res.status} ${res.statusText}`);
-        if (!res.ok) break;
-
-        const html = await res.text();
+        const html = await fetchBoardPageViaProxy({
+          board: "indeed",
+          keyword,
+          page: p,
+          countryCode: this.countryCode,
+          log: this.log,
+        });
         const jobs = this.parseMosaicJson(html);
         this.log(`[Indeed HK] Page ${p}: ${jobs.length} jobs`);
 
@@ -161,8 +169,8 @@ export class IndeedScraper extends BaseJobScraper {
           ) {
             this.log(
               `[Indeed HK] ⛔ Cloudflare security block detected (title: "${title}"). ` +
-              `Indeed blocks datacenter IPs. Set SCRAPERAPI_KEY in Render env vars to bypass. ` +
-              `Skipping remaining pages.`,
+                `Indeed blocks datacenter IPs. Route through the Cloudflare proxy (CLOUDFLARE_PROXY_URL). ` +
+                `Skipping remaining pages.`,
             );
             break;
           }

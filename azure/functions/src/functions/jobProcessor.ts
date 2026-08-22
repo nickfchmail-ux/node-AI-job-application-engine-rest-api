@@ -18,11 +18,17 @@ import { app, InvocationContext } from "@azure/functions";
 import { fetchJobDetail } from "../cloudflareProxy";
 import { enrichOneJob } from "../enrich";
 import {
+  fetchIndeedBatchDescriptionsApi,
   fetchLinkedInDescriptionApi,
   fetchOfferTodayDescriptionApi,
 } from "../publicApiScrapers";
 import { incrementCounters } from "../redisState";
-import { getSupabaseClient, updateJobStatusByUrl } from "../supabase";
+import { bumpRunBoardCounts } from "../runBoardState";
+import {
+  finalizeRunIfDone,
+  getSupabaseClient,
+  updateJobStatusByUrl,
+} from "../supabase";
 import type { JobMessage } from "../types";
 
 app.serviceBusQueue("jobs", {
@@ -78,6 +84,19 @@ app.serviceBusQueue("jobs", {
             );
             if (desc) rawDetailHtml = desc;
           }
+        } else if (board === "indeed") {
+          // Indeed: batch-fetch via the RPC endpoint routed through the
+          // Cloudflare proxy (single call for many jobs instead of N detail
+          // fetches). The scraper worker pre-fetches these before fan-out;
+          // this is a lazy fallback if a job somehow lacks rawDetailHtml.
+          const jobkey = scrapedJob.url.match(/jk=([a-f0-9]{16})/)?.[1];
+          if (jobkey) {
+            const descs = await fetchIndeedBatchDescriptionsApi(
+              [jobkey],
+              console.log,
+            );
+            if (descs[jobkey]) rawDetailHtml = descs[jobkey];
+          }
         }
 
         // Fallback: Cloudflare proxy / residential proxy detail fetch
@@ -101,12 +120,22 @@ app.serviceBusQueue("jobs", {
       // No DeepSeek fit analysis, cover letter, or resume generation.
       // fit / fit_score / cover_letter stay NULL so the frontend shows
       // "Not analysed" and the pipeline costs zero AI tokens.
+      //
+      // The normalized quality contract (structured salary + dataQuality)
+      // arrives on scrapedJob._norm* (stamped by the scraper worker via
+      // applyNormalized) and is persisted so every board's job has the SAME
+      // enriched shape for the frontend.
       const row = {
         title: enriched.title,
         company: enriched.company,
         location: enriched.location ?? null,
         salary: enriched.salary ?? null,
-        posted_date: enriched.postedDate ?? null,
+        salary_min: enriched._normSalary?.min ?? null,
+        salary_max: enriched._normSalary?.max ?? null,
+        salary_period: enriched._normSalary?.period ?? null,
+        salary_currency: enriched._normSalary?.currency ?? null,
+        salary_confidence: enriched._normSalary?.confidence ?? null,
+        posted_date: enriched._normPostedDate ?? enriched.postedDate ?? null,
         url: enriched.url,
         short_description: enriched.description ?? null,
         keyword,
@@ -120,6 +149,16 @@ app.serviceBusQueue("jobs", {
         experience_level: enriched.jobDetail.experienceLevel ?? null,
         about_company: enriched.jobDetail.aboutCompany ?? null,
         raw_description: enriched.jobDetail.rawDescription ?? null,
+        // Data-quality signals (0–100 completeness + presence flags)
+        data_quality: enriched._normDataQuality
+          ? {
+              completeness: enriched._normDataQuality.completeness,
+              has_salary: enriched._normDataQuality.hasSalary,
+              has_description: enriched._normDataQuality.hasDescription,
+              has_posted_date: enriched._normDataQuality.hasPostedDate,
+              has_location: enriched._normDataQuality.hasLocation,
+            }
+          : null,
         // AI analysis fields — intentionally left null (scrape-only)
         fit: null,
         fit_score: null,
@@ -152,6 +191,12 @@ app.serviceBusQueue("jobs", {
       // `processing` counter. Terminal per-job state (completed/failed)
       // lives in Supabase jobs.status and streams via Realtime.
       await incrementCounters(userId, runId, { processing: -1 }, board);
+      // Per-board: count the stored job so the board chip shows progress
+      await bumpRunBoardCounts(runId, board, { jobs_processed: 1 }).catch(
+        () => {},
+      );
+      // If all jobs for this run are now terminal, mark the run completed
+      await finalizeRunIfDone(runId, console.log).catch(() => {});
 
       console.info(
         `[processor] ✓ job ${jobId} done — scraped & stored ("${enriched.title}" @ ${enriched.company})`,
@@ -163,6 +208,12 @@ app.serviceBusQueue("jobs", {
       }).catch(() => {});
       // Redis: decrement the live processing counter on failure too
       await incrementCounters(userId, runId, { processing: -1 }, board);
+      // Per-board: count the failed job
+      await bumpRunBoardCounts(runId, board, { jobs_failed: 1 }).catch(
+        () => {},
+      );
+      // If all jobs for this run are now terminal, mark the run completed
+      await finalizeRunIfDone(runId, console.log).catch(() => {});
       throw err; // rethrow → Service Bus delivers again (at-least-once) up to maxDeliveryCount
     }
   },

@@ -242,7 +242,7 @@ Also subscribe to `pipeline_runs` the same way for live run status.
 
 ## 9. Gotchas / important notes
 
-- **Boards allowed:** `jobsdb`, `ctgoodjobs`, `offertoday`, `linkedin`. (Indeed is disabled.)
+- **Boards allowed:** `jobsdb`, `ctgoodjobs`, `offertoday`, `linkedin`, `indeed`. All routed through the **Cloudflare proxy** (or public APIs for OfferToday/LinkedIn). No ScraperAPI.
 - **Don't expose the Azure function key or Supabase service key in the client bundle.** Use a backend proxy route for anything needing a secret.
 - **Duplicate scrapes are auto-blocked** — if a user re-submits the same keyword while one is running, the backend returns the existing run.
 - **No AI / no resume:** fit scores, cover letters, and resumes are **not generated**. `fit`, `fit_score`, `cover_letter` and resume fields are always `NULL`.

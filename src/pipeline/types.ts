@@ -7,7 +7,7 @@ export interface Job {
   postedDate?: string;
   url: string;
   description?: string;
-  /** Pre-fetched full HTML from Indeed batch API — skips per-job ScraperAPI calls */
+  /** Pre-fetched full HTML from Indeed batch API — skips per-job detail fetches */
   rawDetailHtml?: string;
 }
 

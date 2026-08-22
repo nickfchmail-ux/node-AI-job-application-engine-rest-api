@@ -41,10 +41,22 @@ function parseRelativeDate(raw: string | undefined): string | undefined {
   return undefined; // "Promoted", unknown — discard
 }
 
-const ALL_BOARDS = ["jobsdb", "indeed", "ctgoodjobs", "linkedin", "offertoday"] as const;
+const ALL_BOARDS = [
+  "jobsdb",
+  "indeed",
+  "ctgoodjobs",
+  "linkedin",
+  "offertoday",
+] as const;
 type BoardKey = (typeof ALL_BOARDS)[number];
 
-export const DEFAULT_BOARDS: BoardKey[] = ["jobsdb", "ctgoodjobs", "indeed", "linkedin", "offertoday"];
+export const DEFAULT_BOARDS: BoardKey[] = [
+  "jobsdb",
+  "ctgoodjobs",
+  "indeed",
+  "linkedin",
+  "offertoday",
+];
 
 const BOARD_FACTORIES: Record<BoardKey, () => JobScraper> = {
   jobsdb: () => new JobsDBScraper(),
@@ -69,7 +81,7 @@ export async function scrapeJobs(
     `Boards: ${scrapers.map((s) => s.name).join(", ")} — running in parallel`,
   );
 
-  // Pass country code to scrapers that support geotargeting (e.g. Indeed via ScraperAPI)
+  // Pass country code to scrapers that support geotargeting (e.g. Indeed via proxy)
   for (const s of scrapers) {
     if (s instanceof IndeedScraper && countryCode) {
       s.countryCode = countryCode;

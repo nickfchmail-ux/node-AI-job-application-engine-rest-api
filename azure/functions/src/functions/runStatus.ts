@@ -13,6 +13,8 @@ import {
   HttpResponseInit,
   InvocationContext,
 } from "@azure/functions";
+import { boardDisplayName } from "../boardRegistry";
+import { getRunBoards } from "../runBoardState";
 import { getSupabaseClient } from "../supabase";
 
 app.http("run-status", {
@@ -50,11 +52,48 @@ app.http("run-status", {
         .select("id", { count: "exact", head: true })
         .eq("pipeline_run_id", runId);
 
+      // ── Per-board progress (run_boards) ──
+      const boardRows = await getRunBoards(runId);
+      // Normalize to a frontend-friendly map: { jobsdb: { stage, jobsFound, ... } }
+      const boards: Record<string, Record<string, unknown>> = {};
+      for (const row of boardRows) {
+        const key = String(row.board_key);
+        boards[key] = {
+          stage: row.stage,
+          pagesFetched: row.pages_fetched ?? 0,
+          pagesTotal: row.pages_total ?? 0,
+          jobsFound: row.jobs_found ?? 0,
+          jobsProcessed: row.jobs_processed ?? 0,
+          jobsFailed: row.jobs_failed ?? 0,
+          duplicate: row.duplicate ?? 0,
+          lastError: row.last_error ?? null,
+          displayName: boardDisplayName(key),
+        };
+      }
+      // Ensure every requested board has an entry (default pending)
+      const requested = (run.boards as string[]) ?? [];
+      for (const b of requested) {
+        if (!boards[b]) {
+          boards[b] = {
+            stage: "pending",
+            pagesFetched: 0,
+            pagesTotal: 0,
+            jobsFound: 0,
+            jobsProcessed: 0,
+            jobsFailed: 0,
+            duplicate: 0,
+            lastError: null,
+            displayName: boardDisplayName(b),
+          };
+        }
+      }
+
       return {
         status: 200,
         jsonBody: {
           run,
           jobsCount: count ?? 0,
+          boards,
           // UX-friendly status text mapping (used by the frontend)
           statusLabel: mapStatusLabel(run.status),
         },
