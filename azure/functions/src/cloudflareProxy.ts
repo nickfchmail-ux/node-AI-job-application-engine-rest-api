@@ -10,6 +10,7 @@
 
 import { fetchBoardDirect, fetchDetailDirect } from "./directProxy";
 import { fetchViaScraperApi, isScraperApiConfigured } from "./scraperApi";
+import { getBoardPattern } from "./boardRegistry";
 
 export interface ProxySuccess {
   ok: true;
@@ -53,6 +54,29 @@ export async function fetchBoardPage(opts: {
   log?: (msg: string) => void;
 }): Promise<ProxyResult> {
   const { board, keyword, page, countryCode, log = console.log } = opts;
+
+  // ── Boards that block datacenter IPs (jobsdb returns 403 to Cloudflare) ──
+  // Try the DataImpulse residential proxy FIRST — residential IPs pass
+  // anti-bot, whereas the Cloudflare worker's datacenter egress gets 403'd.
+  const pattern = getBoardPattern(board);
+  const dcBlocked = pattern?.antiBot.datacenterBlocked === true;
+  if (dcBlocked) {
+    const direct = await fetchBoardDirect({
+      board,
+      keyword,
+      page,
+      countryCode,
+      log,
+    });
+    if (direct.ok && direct.html) {
+      log(`[proxy] ${board} p${page} OK via residential (datacenter-blocked board)`);
+      return { ok: true, html: direct.html };
+    }
+    log(
+      `[proxy] ${board} residential-first failed (${direct.error}${direct.detail ? ` ${direct.detail}` : ""}) — falling back to Cloudflare worker`,
+    );
+  }
+
   const base = process.env.CLOUDFLARE_PROXY_URL;
   if (!base) {
     const msg = "CLOUDFLARE_PROXY_URL is not set";
