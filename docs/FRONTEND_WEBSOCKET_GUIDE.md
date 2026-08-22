@@ -38,16 +38,37 @@ type Funnel = {
 `jobsdb`, `ctgoodjobs`, `indeed`, `offertoday`, `linkedin`.
 
 ```ts
-type Boards = Record<
-  string,
-  {
-    scraped: number;    // listings found on this board
-    duplicate: number;  // duplicates from this board
-    unique: number;     // scraped - duplicate on this board
-    processing: number; // jobs from this board currently processing
-  }
->;
+type BoardState = {
+  // Live counters (Redis — update continuously while a run is in progress)
+  scraped: number;      // listings found on this board
+  duplicate: number;    // duplicates from this board
+  unique: number;       // scraped - duplicate on this board
+  processing: number;   // jobs from this board currently enriching (live)
+
+  // Search stage (Supabase run_boards — authoritative "is it done?" answer)
+  stage: string;        // "pending" | "fetching" | "extracting" | "blocked" | "done" | "failed"
+  pagesFetched: number; // search pages successfully fetched
+  pagesTotal: number;   // search pages requested
+  jobsFound: number;    // listings extracted from this board
+  jobsProcessed: number;// jobs fully stored
+  jobsFailed: number;   // jobs that failed to process
+  lastError: string | null; // anti-bot / proxy failure detail (when blocked/failed)
+  displayName: string;  // "JobsDB", "CTgoodjobs", "Indeed", ...
+};
+
+type Boards = Record<string, BoardState>;
 ```
+
+**Stage → UI mapping (the key answer):**
+
+| `stage` | Meaning | Chip state |
+|---------|---------|-----------|
+| `pending` | not started yet | grey "Waiting…" |
+| `fetching` | searching pages now | amber spinner "Searching…" |
+| `extracting` | parsing listings now | amber spinner "Extracting…" |
+| `done` | search finished | green "✓ Done" (N found) |
+| `blocked` | anti-bot/proxy hit | red "⚠ Blocked — retrying via ScraperAPI" (show `lastError`) |
+| `failed` | search failed | red "✗ Failed" (show `lastError`) |
 
 ---
 
@@ -132,17 +153,38 @@ function Funnel({ counts }: { counts: Funnel }) {
 
 ## 3b. Render per-board chips (NEW — from `stats:boards`)
 
-The socket now carries **per-board** live state, so you can render one chip per
-job board and see which board is slow/blocked/fast — all from the same socket.
+The socket now carries **per-board** live state — both the live counters AND
+the search stage (`pending → fetching → extracting → done | blocked | failed`).
+You can render one chip per job board and show exactly **whether each board's
+search is done or still processing** — all from the same socket.
 
 ```tsx
-const BOARD_LABELS: Record<string, string> = {
-  jobsdb: "JobsDB",
-  ctgoodjobs: "CTgoodjobs",
-  indeed: "Indeed",
-  offertoday: "OfferToday",
-  linkedin: "LinkedIn",
-};
+// Each board chip shows: name, search stage, and live count.
+// stage tells the user if THIS board's search is done or still working.
+function BoardChip({ b }: { b: BoardState }) {
+  const stageMeta: Record<string, { label: string; cls: string }> = {
+    pending:    { label: "Waiting…",       cls: "chip-pending" },
+    fetching:   { label: "Searching…",     cls: "chip-busy" },
+    extracting: { label: "Extracting…",    cls: "chip-busy" },
+    done:       { label: "✓ Done",         cls: "chip-done" },
+    blocked:    { label: "⚠ Blocked",      cls: "chip-error" },
+    failed:     { label: "✗ Failed",       cls: "chip-error" },
+  };
+  const meta = stageMeta[b.stage] ?? stageMeta.pending;
+
+  return (
+    <div className={`board-chip ${meta.cls}`}>
+      <span className="board-name">{b.displayName}</span>
+      <span className="board-stage">{meta.label}</span>
+      {b.stage === "done" && <span className="board-count">{b.jobsFound} found</span>}
+      {b.stage === "blocked" && b.lastError && (
+        <span className="board-error" title={b.lastError}>
+          {b.lastError.slice(0, 40)}…
+        </span>
+      )}
+    </div>
+  );
+}
 
 function BoardChips({ boards }: { boards: Boards | null }) {
   if (!boards) return null;
@@ -152,11 +194,7 @@ function BoardChips({ boards }: { boards: Boards | null }) {
   return (
     <div role="status" aria-live="polite" className="board-chips">
       {entries.map(([board, b]) => (
-        <div key={board} className="board-chip">
-          <span className="board-name">{BOARD_LABELS[board] ?? board}</span>
-          <span className="board-count">{b.scraped} found</span>
-          {b.processing > 0 && <span className="board-spinner">⟳ {b.processing}</span>}
-        </div>
+        <BoardChip key={board} b={b} />
       ))}
     </div>
   );
@@ -167,15 +205,16 @@ Wire it into the hook:
 
 ```tsx
 const { summary, runs, boards } = useLiveStats();
-// boards["<runId>"] → { jobsdb: {...}, indeed: {...}, ... }
+// boards["<runId>"] → { jobsdb: { scraped, stage, jobsFound, lastError, ... }, ... }
 ```
 
 **Semantics:**
-- `scraped` per board = listings found from that board
-- `processing` per board = jobs from that board still enriching — show a spinner
-- `duplicate` per board = deduped from that board — grey
-- `unique` per board = `scraped - duplicate`
-- A board with `scraped: 0` while others have numbers = **blocked/slow** (fallback to ScraperAPI); highlight it in amber to draw the eye.
+- `stage` is the **authoritative answer** to "is this board's search done?":
+  `fetching`/`extracting` = still searching (spinner), `done` = finished, `blocked`/`failed` = error
+- `scraped` / `processing` per board = live Redis counters (update continuously)
+- `jobsFound` per board = total listings extracted once the board is `done`
+- `lastError` per board = why it got `blocked`/`failed` (e.g. "anti-bot challenge", "timeout")
+- A board stuck on `fetching` for a long time while others are `done` = **slow** (likely ScraperAPI fallback); keep the spinner visible
 
 ---
 
@@ -199,5 +238,6 @@ const { summary, runs, boards } = useLiveStats();
 3. A logged-out / expired-token client gets `connect_error` and the UI shows a friendly "reconnecting…".
 4. On connect, `stats:boards` fires for the latest run — the board chips render immediately.
 5. While a run is in progress, `stats:boards` updates each board chip as Azure bumps per-board counters.
-4. A user **never** sees another user's counters (room-scoped by verified JWT).
-5. The funnel is one source of truth for totals; per-job/per-board detail comes from Supabase Realtime.
+6. Each board chip shows its **search stage** (`fetching`/`extracting` = spinner, `done` = ✓, `blocked`/`failed` = error + `lastError`) — so the user can see *which boards have finished searching and which are still working*.
+7. A user **never** sees another user's counters (room-scoped by verified JWT).
+8. The funnel is one source of truth for totals; per-job/per-board detail comes from Supabase Realtime.
