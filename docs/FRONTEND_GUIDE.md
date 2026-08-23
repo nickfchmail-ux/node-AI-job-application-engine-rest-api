@@ -117,8 +117,13 @@ import { io } from "socket.io-client";
 const socket = io(process.env.NEXT_PUBLIC_API_SERVER!, {
   auth: { token: accessToken }, transports: ["websocket"],
 });
-socket.on("stats:summary", (d) => setFunnel(d.counts)); // { scraped, duplicate, unique, processing }
-socket.on("stats:run", (d) => setRunFunnel(d.runId, d.counts));
+// ONE event carries summary + run + boards + status:
+socket.on("stats", (d) => {
+  setFunnel(d.summary);          // { scraped, duplicate, unique, processing } (all runs)
+  setRunFunnel(d.runId, d.counts); // this run's funnel
+  setBoards(d.boards);           // per-board stage/chips
+  setRunStatus(d.statusLabel);   // "Searching the job boards…"
+});
 ```
 
 ---
@@ -159,6 +164,7 @@ Per-board counters: `jobs_found`, `jobs_processed`, `jobs_failed`, `duplicate`, 
 |---------|-----------|------|
 | `discovered` / `queued` | "Found" / "In line" | neutral |
 | `processing` | "Loading job details…" | active |
+| `retrying` | "Hitting a snag, retrying…" | active |
 | `completed` | "Saved ✓" | success |
 | `failed` | "Failed" | error |
 | `duplicate` | "Already saved" | muted |

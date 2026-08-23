@@ -304,21 +304,25 @@ const socket = io("https://ai-job-server.onrender.com", {
 
 ### Events
 
-| Event           | Payload                           | When                                                           |
-| --------------- | --------------------------------- | -------------------------------------------------------------- |
-| `connect`       | —                                 | Connected to server                                            |
-| `stats:summary` | `{ ok, counts: <funnel> }`        | On connect + every counter change (aggregated across all runs) |
-| `stats:run`     | `{ ok, runId, counts: <funnel> }` | Counter change for a specific run                              |
-| `connect_error` | `{ message }`                     | Auth failed (invalid/expired token)                            |
+> **One event.** The server emits a single `stats` event that bundles summary +
+> run + boards + status into one object (the old `stats:summary` / `stats:run` /
+> `stats:boards` events are removed).
+
+| Event           | Payload                                                                                    | When                                |
+| --------------- | ------------------------------------------------------------------------------------------ | ----------------------------------- |
+| `connect`       | —                                                                                          | Connected to server                 |
+| `stats`         | `{ ok, summary, runId, counts, boards, status, statusLabel }` (full shape below)           | On connect + every state change     |
+| `connect_error` | `{ message }`                                                                              | Auth failed (invalid/expired token) |
 
 ```js
-socket.on("stats:summary", (data) => {
-  // Update your dashboard funnel with data.counts
-  console.log(data.counts);
-});
-socket.on("stats:run", (data) => {
-  // Update the specific run card
-  console.log(data.runId, data.counts);
+socket.on("stats", (data) => {
+  // data.summary       → { scraped, duplicate, unique, processing }  (all runs)
+  // data.runId         → current run id
+  // data.counts        → this run's funnel
+  // data.boards        → { jobsdb: { stage, jobsFound, ... }, ... }
+  // data.status        → "scraping" | "processing" | "completed" | ...
+  // data.statusLabel   → "Searching the job boards…"
+  console.log(data);
 });
 ```
 
@@ -351,8 +355,9 @@ supabase.auth.setSession({ access_token, refresh_token });
 | `id` | uuid | PK |
 | `title`, `company`, `location`, `salary` | text | Listing info |
 | `url` | text | Job post URL |
-| `status` | text | `queued → processing → completed / failed` |
-| `board` | text | `jobsdb` / `ctgoodjobs` / `offertoday` / `linkedin` |
+| `status` | text | `queued → processing → completed / failed / retrying` |
+| `last_error` | text | Per-job failure/retry detail (when `failed`/`retrying`) |
+| `board` | text | `jobsdb` / `ctgoodjobs` / `offertoday` / `linkedin` / `indeed` |
 | `responsibilities`, `requirements`, `benefits`, `skills` | jsonb | Parsed from the full description |
 | `employment_type`, `experience_level`, `about_company` | text | Parsed detail |
 | `raw_description` | text | Full raw description |
@@ -361,6 +366,11 @@ supabase.auth.setSession({ access_token, refresh_token });
 | `resume_status` | text | Always `none` (resume generation disabled) |
 | `user_id` | uuid | Owner (RLS) |
 | `pipeline_run_id` | uuid | Parent run |
+
+> **`retrying` status (NEW):** when a job's detail fetch fails due to a transient
+> upstream issue (proxy timeout, anti-bot block, rate limit), the processor marks
+> it `retrying` and Service Bus redelivers — a later success flips it to
+> `completed`. The run is NOT finalized while any job is `retrying`.
 
 **`pipeline_runs`** — a scrape run
 | Column | Notes |
@@ -492,7 +502,7 @@ render any job card without branching on `board`.
 
 ```
 1. User logs in  →  POST /auth/login  →  { access_token, refresh_token }
-2. Open WebSocket with the token → receives live stats:summary + stats:run
+2. Open WebSocket with the token → receives live `stats` (summary + run + boards + status)
 3. Start a scrape  →  POST /api/scrape (Azure)  →  { runId }
 4. Show the funnel dashboard from WebSocket events (no polling):
      scraped → duplicate → unique → processing
@@ -503,7 +513,8 @@ render any job card without branching on `board`.
 
 ```
 discovered/queued → processing (detail scrape) → completed
-  → any step can fail → failed (see job.status / run.last_error)
+  → any step can fail → failed (see job.status / job.last_error / run.last_error)
+  → transient upstream failure → retrying → completed/failed on redelivery
 ```
 
 Terminal job states come from Supabase `jobs.status` (Realtime), not the Redis

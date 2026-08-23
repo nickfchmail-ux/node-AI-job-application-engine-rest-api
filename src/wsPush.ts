@@ -6,10 +6,27 @@
 //  Flow:
 //    Azure Functions write counters to Redis, then POST to
 //    /webhook/state  →  this module looks up the counters and
-//    emits a "stats" event to the user's Socket.io room.
+//    emits a SINGLE "stats" event to the user's Socket.io room.
 //
 //  Rooms are user-scoped:  user:{userId}
 //  The client authenticates via the Supabase JWT on connect.
+//
+//  ── SIMPLIFIED CONTRACT ──────────────────────────────────
+//  Instead of scattering state across stats:summary / stats:run /
+//  stats:boards, the server now pushes ONE event:
+//
+//    "stats" → {
+//        ok: true,
+//        summary: <funnel>,              // aggregated across all runs
+//        runId: "<current run id>",      // the latest / most-relevant run
+//        counts: <funnel>,               // this run's funnel
+//        boards: { <board>: <BoardState>, ... },
+//        status: <pipeline_runs.status | null>,  // queued|scraping|processing|completed|failed|retrying
+//        statusLabel: <human copy | null>
+//    }
+//
+//  The frontend listens to ONE event and gets everything in one
+//  object — no more juggling three separate payload shapes.
 // ============================================================
 
 import { Server as HttpServer } from "http";
@@ -51,6 +68,26 @@ export interface BoardState {
   displayName: string;  // human-readable board name
 }
 
+/**
+ * The SIMPLIFIED unified payload the frontend receives on ONE "stats" event.
+ * Everything the dashboard needs in a single flat object.
+ */
+export interface StatsPayload {
+  ok: boolean;
+  /** Aggregated funnel across all the user's runs. */
+  summary: ReturnType<typeof funnelFrom>;
+  /** The current / most-recent run id (null when the user has no runs). */
+  runId: string | null;
+  /** This run's funnel counters. */
+  counts: ReturnType<typeof funnelFrom>;
+  /** Per-board live state for this run. */
+  boards: Record<string, BoardState>;
+  /** Run status: queued | scraping | processing | completed | failed | retrying | null. */
+  status: string | null;
+  /** Human-friendly status copy. */
+  statusLabel: string | null;
+}
+
 const BOARD_DISPLAY: Record<string, string> = {
   jobsdb: "JobsDB",
   ctgoodjobs: "CTgoodjobs",
@@ -76,6 +113,26 @@ function emptyBoard(board: string): BoardState {
   };
 }
 
+/** Map machine run status → warm human copy (mirrors runStatus.ts). */
+function mapStatusLabel(status: string | null): string | null {
+  switch (status) {
+    case "queued":
+      return "In line…";
+    case "scraping":
+      return "Searching the job boards…";
+    case "processing":
+      return "Loading job details…";
+    case "completed":
+      return "Done ✓";
+    case "failed":
+      return "Something went wrong — retry";
+    case "retrying":
+      return "Hitting a snag, retrying…";
+    default:
+      return status;
+  }
+}
+
 /**
  * Read run_boards rows + the run's requested board list from Supabase.
  * This is the authoritative source for EACH board's search stage
@@ -83,7 +140,11 @@ function emptyBoard(board: string): BoardState {
  */
 async function getRunBoardDetail(
   runId: string,
-): Promise<{ rows: Record<string, unknown>[]; requested: string[] }> {
+): Promise<{
+  rows: Record<string, unknown>[];
+  requested: string[];
+  status: string | null;
+}> {
   try {
     const supabase = getSupabaseClient();
     const [{ data: rows, error: rowErr }, { data: run, error: runErr }] =
@@ -91,7 +152,7 @@ async function getRunBoardDetail(
         supabase.from("run_boards").select("*").eq("run_id", runId),
         supabase
           .from("pipeline_runs")
-          .select("boards")
+          .select("boards, status")
           .eq("id", runId)
           .maybeSingle(),
       ]);
@@ -100,10 +161,11 @@ async function getRunBoardDetail(
     return {
       rows: (rows ?? []) as Record<string, unknown>[],
       requested: ((run?.boards as string[]) ?? []) as string[],
+      status: (run?.status as string | undefined) ?? null,
     };
   } catch (err) {
     console.warn(`[ws] getRunBoardDetail(${runId}) failed: ${err}`);
-    return { rows: [], requested: [] };
+    return { rows: [], requested: [], status: null };
   }
 }
 
@@ -179,6 +241,49 @@ export function boardsFrom(
   return boards;
 }
 
+/**
+ * Build the unified "stats" payload for a user + optional run.
+ * When runId is omitted, uses the latest run (so connect always
+ * delivers everything the dashboard needs in ONE event).
+ */
+async function buildStats(
+  userId: string,
+  runId?: string | null,
+): Promise<StatsPayload> {
+  const summary = funnelFrom(await getUserSummary(userId));
+
+  // Resolve the run to show: the explicit one, else the latest.
+  let targetRun = runId ?? null;
+  if (!targetRun) targetRun = await getLatestRunId(userId);
+  if (!targetRun) {
+    return {
+      ok: true,
+      summary,
+      runId: null,
+      counts: funnelFrom({}),
+      boards: {},
+      status: null,
+      statusLabel: null,
+    };
+  }
+
+  const [runCounts, boardCounts, detail] = await Promise.all([
+    getRunCounts(userId, targetRun),
+    getRunBoardCounts(userId, targetRun),
+    getRunBoardDetail(targetRun),
+  ]);
+
+  return {
+    ok: true,
+    summary,
+    runId: targetRun,
+    counts: funnelFrom(runCounts),
+    boards: boardsFrom(boardCounts, detail.rows, detail.requested),
+    status: detail.status,
+    statusLabel: mapStatusLabel(detail.status),
+  };
+}
+
 let io: SocketIOServer | null = null;
 
 /** Start Socket.io on the HTTP server. */
@@ -217,37 +322,10 @@ export function initWs(server: HttpServer): SocketIOServer {
     socket.join(`user:${userId}`);
     console.log(`[ws] user ${userId} connected (socket ${socket.id})`);
 
-    // On connect, push the current aggregate summary so the UI
-    // renders instantly without a separate fetch.
-    getUserSummary(userId)
-      .then((counts: Record<string, number>) => {
-        socket.emit("stats:summary", { ok: true, counts: funnelFrom(counts) });
-      })
-      .catch(() => {});
-
-    // Also push the latest run's per-board breakdown on connect so the
-    // dashboard renders board chips immediately, without waiting for the
-    // next Azure webhook push. Uses Supabase (ordered by created_at) — NOT
-    // the unordered Redis set — so we always pick the current active run.
-    getLatestRunId(userId)
-      .then(async (latestId) => {
-        if (!latestId) return;
-        const [runCounts, boardCounts, detail] = await Promise.all([
-          getRunCounts(userId, latestId),
-          getRunBoardCounts(userId, latestId),
-          getRunBoardDetail(latestId),
-        ]);
-        socket.emit("stats:run", {
-          ok: true,
-          runId: latestId,
-          counts: funnelFrom(runCounts),
-        });
-        socket.emit("stats:boards", {
-          ok: true,
-          runId: latestId,
-          boards: boardsFrom(boardCounts, detail.rows, detail.requested),
-        });
-      })
+    // On connect, push the full current state in ONE event so the UI
+    // renders instantly without a separate fetch or a "waiting" state.
+    buildStats(userId, null)
+      .then((payload) => socket.emit("stats", payload))
       .catch(() => {});
 
     socket.on("disconnect", () => {
@@ -259,37 +337,14 @@ export function initWs(server: HttpServer): SocketIOServer {
 }
 
 /**
- * Push a stats update to a user's room.
- * runId is optional — when given, also emits the per-run funnel AND the
- * per-board breakdown (stats:boards) so the frontend can show each board's
- * live state from the socket alone.
+ * Push the unified stats update to a user's room.
+ * runId is optional — when given, that run is shown; otherwise the latest.
  */
 export async function pushStats(userId: string, runId?: string): Promise<void> {
   if (!io) return;
   try {
-    const [summary, runCounts, boardCounts, detail] = await Promise.all([
-      getUserSummary(userId),
-      runId ? getRunCounts(userId, runId) : Promise.resolve({}),
-      runId ? getRunBoardCounts(userId, runId) : Promise.resolve({}),
-      runId ? getRunBoardDetail(runId) : Promise.resolve({ rows: [], requested: [] }),
-    ]);
-    io.to(`user:${userId}`).emit("stats:summary", {
-      ok: true,
-      counts: funnelFrom(summary),
-    });
-    if (runId) {
-      io.to(`user:${userId}`).emit("stats:run", {
-        ok: true,
-        runId,
-        counts: funnelFrom(runCounts),
-      });
-      // Per-board live state: counters (Redis) + search stage/progress (run_boards)
-      io.to(`user:${userId}`).emit("stats:boards", {
-        ok: true,
-        runId,
-        boards: boardsFrom(boardCounts, detail.rows, detail.requested),
-      });
-    }
+    const payload = await buildStats(userId, runId);
+    io.to(`user:${userId}`).emit("stats", payload);
   } catch (err) {
     console.warn(`[ws] pushStats(${userId}/${runId}) failed: ${err}`);
   }

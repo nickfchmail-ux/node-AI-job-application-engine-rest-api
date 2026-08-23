@@ -91,7 +91,8 @@ and the Cloudflare proxy config, not from assumptions.
 | Quirk                                    | Boards                     | Normalizer behaviour                  |
 | ---------------------------------------- | -------------------------- | ------------------------------------- |
 | HTML entities in title (`&amp;`)         | CTgoodjobs, JobsDB         | `cleanText()` decodes + strips tags   |
-| Relative posted date (`3d ago`, `Today`) | JobsDB, OfferToday, Indeed | → ISO `YYYY-MM-DD`                    |
+| Relative posted date (`3d ago`, `Today`) | JobsDB, OfferToday, Indeed | → ISO `YYYY-MM-DD` (K/M/B, `dd/mm/yyyy`, datetime-with-space supported) |
+| Recruiter-prefixed company               | OfferToday (`brandName`)   | `cleanCompany()` collapses "Recruiter:"/"via" prefixes |
 | Salary as structured `{min,max,type}`    | Indeed                     | → `"min–max type"` display string     |
 | Missing location                         | all                        | → `"Hong Kong"`                       |
 | Unparseable posted date (`Promoted`)     | JobsDB                     | → `null` (date unknown)               |
@@ -253,9 +254,12 @@ Full contract: `docs/FRONTEND_API.md`.
 | ------------------------------- | -------------------- | ----------------------------------------------------------------------------------------- |
 | Cloudflare challenge on a board | Proxy Agent          | `blocked` → fallback to DataImpulse residential → `run_boards.stage=blocked`, run retries |
 | Board returns 0 jobs            | Parser Agent         | `run_boards.stage=failed` (board-level, non-fatal to run)                                 |
-| All boards fail                 | Scraper Worker       | `pipeline_runs.status=failed` with `last_error`                                           |
-| Detail fetch fails for a job    | Job Processor        | `jobs.status=failed`; Service Bus redelivers (maxDeliveryCount)                           |
+| One board crashes               | Scraper Worker       | Board marked `failed`, run continues with the other boards (never kills the whole run)    |
+| All boards fail                 | Scraper Worker       | `pipeline_runs.status=failed` with a human-readable `last_error`                          |
+| Detail fetch fails (transient)  | Job Processor        | `jobs.status=retrying`; Service Bus redelivers (at-least-once) → later success = `completed` |
+| Detail fetch fails (fatal)      | Job Processor        | `jobs.status=failed` + `last_error`; message completed (no wasted redeliveries)           |
 | Duplicate URL/title+company     | Scraper Worker dedup | Counted as `duplicate`; not re-inserted                                                   |
+| Service Bus send hangs          | scrape trigger       | 30s timeout → run marked `failed` with `last_error` (HTTP never hangs)                    |
 
 **Politeness:** per-board minimum intervals in the Cloudflare worker
 (`BOARD_MIN_INTERVAL_MS`) + KV caching of successful pages.
@@ -275,16 +279,21 @@ Full contract: `docs/FRONTEND_API.md`.
 | `azure/functions/src/functions/jobProcessor.ts`      | Persist structured salary + `data_quality` into the `jobs` row                                                                              |
 | `azure/functions/src/functions/runStatus.ts`         | Expose `boards` per-board detail                                                                                                            |
 | `azure/functions/src/types.ts`                       | `ScrapedJob` `_norm*` transport fields; `JobRow` quality columns                                                                            |
-| `azure/functions/src/boardParsers.ts`                | OfferToday HTML fallback no longer emits literal `"N/A"`                                                                                    |
-| `docs/FRONTEND_API.md`                               | Document board stages + normalized contract (structured salary + data_quality)                                                              |
+| `azure/functions/src/boardParsers.ts`                | OfferToday HTML fallback no longer emits literal `"N/A"`; JobsDB `__NEXT_DATA__` grabs full description; LinkedIn listing salary              |
+| `azure/functions/src/publicApiScrapers.ts`           | OfferToday detail prefers `translateJobDesc`; `parsePostTime` handles ISO dates                                                             |
+| `azure/functions/src/functions/jobProcessor.ts`      | Persist structured salary + `data_quality`; transient-vs-fatal error handling (`retrying` vs `failed`)                                       |
+| `azure/functions/src/supabase.ts`                    | `finalizeRunIfDone` treats `retrying` as non-terminal (run not finalized early)                                                             |
+| `supabase/migrations/0015_jobs_retrying.sql`         | **NEW** — `jobs.status` gains `retrying`; `jobs.last_error` column                                                                          |
+| `azure/functions/src/serviceBus.ts`                  | `enqueue` 30s timeout guard                                                                                                                  |
+| `azure/functions/src/functions/scrape.ts`            | Enqueue failure marks run failed with `last_error` (HTTP 503, never hangs)                                                                  |
+| `src/wsPush.ts`                                      | **Simplified socket contract** — one `stats` event (summary + run + boards + status) replaces `stats:summary`/`stats:run`/`stats:boards`    |
+| `docs/FRONTEND_API.md`                               | Document board stages + normalized contract (structured salary + data_quality); unified socket event                                         |
 
 ---
 
 ## 8. Next steps (suggested)
 
-1. **Run migration** `0011_run_boards.sql` in Supabase SQL editor.
-2. **Deploy** the updated Azure Functions (`func azure functionapp publish`).
-3. **Frontend:** subscribe to Realtime on `run_boards` for per-board chips; use the
-   normalized contract for cards (no per-source branching).
-4. **Optional:** extend `normalize.ts` to also clean company names / title casing;
-   add a `dataQuality` badge UI.
+1. **Run migration** `0011_run_boards.sql` **and** `0015_jobs_retrying.sql` in the Supabase SQL editor.
+2. **Deploy** the updated Azure Functions (`func azure functionapp publish`) + the Express server (WebSocket `stats` event).
+3. **Frontend:** subscribe to the single WebSocket `stats` event (summary + run + boards + status) + Realtime on `run_boards` for per-board chips; use the normalized contract for cards (no per-source branching).
+4. **Optional:** extend `normalize.ts` to also clean company names / title casing; add a `dataQuality` badge UI.

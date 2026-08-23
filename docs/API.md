@@ -276,12 +276,36 @@ const socket = io("wss://ai-job-server.onrender.com", {
 
 ## Events
 
-| Event           | Direction     | Payload                                 | Trigger                           |
-| --------------- | ------------- | --------------------------------------- | --------------------------------- |
-| `connect`       | server→client | —                                       | Connected                         |
-| `stats:summary` | server→client | `{ ok: true, counts: <funnel> }`        | On connect + every counter change |
-| `stats:run`     | server→client | `{ ok: true, runId, counts: <funnel> }` | Counter change for a run          |
-| `connect_error` | server→client | `{ message }`                           | Auth failed                       |
+The server pushes **one** event, `stats`, that bundles everything the dashboard
+needs into a single flat object:
+
+| Event           | Direction     | Payload                                                                       | Trigger                           |
+| --------------- | ------------- | ----------------------------------------------------------------------------- | --------------------------------- |
+| `connect`       | server→client | —                                                                             | Connected                         |
+| `stats`         | server→client | `{ ok, summary, runId, counts, boards, status, statusLabel }` (see below)     | On connect + every state change   |
+| `connect_error` | server→client | `{ message }`                                                                 | Auth failed                       |
+
+**Payload shape (`stats`):**
+
+```ts
+{
+  ok: true,
+  summary: { scraped, duplicate, unique, processing },  // aggregated across all runs
+  runId: string | null,                                  // current / most-recent run
+  counts: { scraped, duplicate, unique, processing },    // this run's funnel
+  boards: {
+    jobsdb:     { scraped, duplicate, unique, processing, stage, pagesFetched, pagesTotal, jobsFound, jobsProcessed, jobsFailed, lastError, displayName },
+    ctgoodjobs: { ...same shape },
+    // ... one entry per board
+  },
+  status: string | null,      // queued | scraping | processing | completed | failed | retrying
+  statusLabel: string | null  // "Searching the job boards…"
+}
+```
+
+> **Simplified contract (2026-08-23):** the old `stats:summary`, `stats:run`,
+> and `stats:boards` events are **removed**. Clients should listen to the single
+> `stats` event.
 
 ## Error codes (`connect_error.message`)
 
@@ -416,6 +440,7 @@ Duplicate submissions (same user+keyword active) return the existing `jobId` wit
 
 - `pipeline_runs.last_error` — run failure (e.g. "All boards failed", "All scraped jobs already exist")
 - `jobs.status = failed` — individual job scrape failure
+- `jobs.last_error` — per-job retry/failure detail
 - `connect_error.message` — WebSocket auth failure
 
 ---
@@ -425,7 +450,7 @@ Duplicate submissions (same user+keyword active) return the existing `jobId` wit
 ```
 1. POST /auth/login                     → access_token
 2. POST /api/scrape                     → runId
-3. WebSocket connect (auth.token)       → live stats:summary / stats:run
+3. WebSocket connect (auth.token)       → live stats (summary + run + boards + status)
 4. Supabase Realtime (jobs / pipeline_runs) → live rows + per-job status
 5. Read job details from jobs row (title, company, description, requirements, ...)
 ```

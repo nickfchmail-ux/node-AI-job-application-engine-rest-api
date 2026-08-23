@@ -134,8 +134,7 @@ import { useAuth } from "./auth";
 
 export function useLiveStats() {
   const { session } = useAuth();
-  const [summary, setSummary] = useState(null);
-  const [runs, setRuns] = useState<Record<string, any>>({});
+  const [stats, setStats] = useState<StatsPayload | null>(null);
 
   useEffect(() => {
     if (!session?.access_token) return;
@@ -143,14 +142,12 @@ export function useLiveStats() {
       auth: { token: session.access_token },
       transports: ["websocket"],
     });
-    socket.on("stats:summary", (d) => setSummary(d.counts));
-    socket.on("stats:run", (d) =>
-      setRuns((p) => ({ ...p, [d.runId]: d.counts })),
-    );
+    // ONE event carries everything: summary + run + boards + status.
+    socket.on("stats", (d: StatsPayload) => setStats(d));
     return () => socket.disconnect();
   }, [session?.access_token]);
 
-  return { summary, runs };
+  return stats;
 }
 ```
 
@@ -163,21 +160,25 @@ Scraped (62)
      └─ Processing (3)   ← detail-scrape / enriching now
 ```
 
-Per-job terminal states (queued → processing → completed / failed) are not in
-these counters — they live in Supabase `jobs.status` and stream via Realtime.
+Per-job terminal states (queued → processing → completed / failed / retrying)
+are not in these counters — they live in Supabase `jobs.status` and stream via
+Realtime.
 
-**Use a funnel/stepper visual.** The funnel object shape you receive:
+**Use a funnel/stepper visual.** The `stats` payload you receive:
 
 ```json
 {
-  "scraped": 62,
-  "duplicate": 34,
-  "unique": 28,
-  "processing": 3
+  "ok": true,
+  "summary": { "scraped": 200, "duplicate": 120, "unique": 80, "processing": 3 },
+  "runId": "07b0cadf-...",
+  "counts": { "scraped": 62, "duplicate": 34, "unique": 28, "processing": 3 },
+  "boards": { "jobsdb": { "stage": "done", "jobsFound": 30, "...": "" } },
+  "status": "processing",
+  "statusLabel": "Loading job details…"
 }
 ```
 
-**Acceptance criteria:** numbers update LIVE as jobs process — no refresh, no polling. Per-board breakdown available via `GET /stats/runs/:runId` (response `boards` key).
+**Acceptance criteria:** numbers update LIVE as jobs process — no refresh, no polling. Per-board breakdown is inside the same `stats` event (`boards` key).
 
 ---
 
@@ -221,7 +222,7 @@ Also subscribe to `pipeline_runs` the same way for live run status.
 2. **`/dashboard`** —
    - Search bar (keyword + pages + board checkboxes) → POST /api/scrape
    - **Live funnel** (from WebSocket)
-   - **Active runs list** (from `GET /stats/runs` + WS `stats:run`)
+   - **Active runs list** (from `GET /stats/runs` + WS `stats`)   
    - **Live jobs table** (from Supabase Realtime)
 3. **Job detail modal** — description, responsibilities, requirements, benefits, skills
 
