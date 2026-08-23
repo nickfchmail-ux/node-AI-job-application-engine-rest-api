@@ -31,19 +31,55 @@ export type RunStatus =
   | "failed"
   | "retrying";
 
+/** Statuses that a run can never leave once reached. */
+const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set<RunStatus>([
+  "completed",
+  "failed",
+]);
+/** Statuses a non-terminal transition is allowed to move FROM. */
+const NON_TERMINAL_STATUSES: RunStatus[] = [
+  "queued",
+  "scraping",
+  "processing",
+  "retrying",
+];
+
 /**
  * Update a pipeline_run row. Only non-undefined fields are patched.
  * Returns false on error (caller logs).
+ *
+ * RACE-SAFE / ATOMIC: when the patch changes `status` to a NON-terminal
+ * value (queued/scraping/processing/retrying), the UPDATE is issued as a
+ * single conditional statement that only matches rows currently in a
+ * non-terminal status. A run that already reached a TERMINAL status
+ * (completed/failed) can never be regressed — even under concurrency,
+ * because Postgres evaluates the WHERE clause atomically per statement.
+ *
+ * Why: the scraper worker marks the run "processing" once ALL boards are
+ * enqueued, but fast boards (offertoday/linkedin public APIs) let the job
+ * processor finish — and call finalizeRunIfDone → markRunCompleted — BEFORE
+ * the scraper worker reaches that line. Without this guard the scraper's
+ * late "processing" write would clobber a run that already reached
+ * "completed", leaving the dashboard stuck on "processing" forever.
+ *
+ * Terminal patches (completed/failed) always apply — they can only move the
+ * run forward, never backward.
  */
 export async function updateRun(
   runId: string,
   patch: Partial<PipelineRunPatch>,
 ): Promise<boolean> {
   const supabase = getSupabaseClient();
-  const { error } = await supabase
-    .from("pipeline_runs")
-    .update(patch)
-    .eq("id", runId);
+
+  let query = supabase.from("pipeline_runs").update(patch).eq("id", runId);
+
+  // For a non-terminal status transition, only allow it when the row is
+  // currently non-terminal (atomic guard against regressing a terminal run).
+  if (patch.status && !TERMINAL_STATUSES.has(patch.status as RunStatus)) {
+    query = query.in("status", NON_TERMINAL_STATUSES);
+  }
+
+  const { error } = await query;
   if (error) {
     console.error(`[supabase] updateRun(${runId}) failed: ${error.message}`);
     return false;
@@ -130,12 +166,16 @@ export async function finalizeRunIfDone(
   const processed = data.filter((r) => r.status === "completed").length;
   const failed = data.filter((r) => r.status === "failed").length;
   const duplicate = data.filter((r) => r.status === "duplicate").length;
+  const retrying = data.filter((r) => r.status === "retrying").length;
 
-  const allDone = data.every((r) => terminal.has(r.status));
+  // A job stuck in `retrying` is NOT terminal — Service Bus will redeliver
+  // and eventually flip it to completed/failed. Don't finalize the run early.
+  const allDone =
+    data.length > 0 && data.every((r) => terminal.has(r.status));
   if (!allDone) return false;
 
   log(
-    `[supabase] finalizeRunIfDone(${runId}) — all ${data.length} jobs terminal (processed=${processed}, failed=${failed}, duplicate=${duplicate})`,
+    `[supabase] finalizeRunIfDone(${runId}) — all ${data.length} jobs terminal (processed=${processed}, failed=${failed}, duplicate=${duplicate}, retrying=${retrying})`,
   );
   await markRunCompleted(runId, {
     total: data.length,
@@ -184,9 +224,16 @@ export async function upsertJob(
   row: Record<string, unknown>,
 ): Promise<boolean> {
   const supabase = getSupabaseClient();
-  const { error } = await supabase.from("jobs").upsert(row, {
-    onConflict: "url,scraped_date,user_id",
-  });
+  const { error } = await supabase.from("jobs").upsert(
+    { ...row, last_seen_at: new Date().toISOString() },
+    {
+      onConflict: "url,user_id",
+      // Date-independent dedup (migration 0016): same URL + user = ONE
+      // row. last_seen_at is refreshed on conflict; scraped_date stays
+      // the first-seen date.
+      ignoreDuplicates: false,
+    },
+  );
   if (error) {
     console.error(`[supabase] upsertJob failed: ${error.message}`);
     return false;
