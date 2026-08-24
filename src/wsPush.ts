@@ -294,7 +294,7 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
       await Promise.all([
         supabase
           .from("pipeline_runs")
-          .select("evaluation_status")
+          .select("evaluation_status, user_id")
           .eq("id", runId)
           .maybeSingle(),
         supabase
@@ -307,40 +307,55 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
       console.warn(`[ws] evaluation run(${runId}) failed: ${runErr.message}`);
     if (rowsErr)
       console.warn(`[ws] evaluation_runs(${runId}) failed: ${rowsErr.message}`);
+    const userId = run?.user_id;
 
-    // Fetch this run's jobs so we can compute fit / not-fit / remaining per
-    // batch. Fit counts come from the scored jobs; remaining = unscored.
-    const { data: jobs, error: jobsErr } = await supabase
-      .from("jobs")
-      .select("search_key, fit, fit_score")
-      .eq("pipeline_run_id", runId);
+    // Fetch the user's jobs (account-wide) so fit / not-fit / remaining match
+    // the batch total even when the batch spans multiple runs. A job counts
+    // toward a batch if it was touched by that batch (scored at/after the
+    // batch's created_at, or still unscored).
+    const { data: jobs, error: jobsErr } = userId
+      ? await supabase
+          .from("jobs")
+          .select("search_key, fit, fit_score, updated_at")
+          .eq("user_id", userId)
+          .in("status", ["completed", "analysed"])
+      : { data: null, error: null };
     if (jobsErr) console.warn(`[ws] jobs(${runId}) failed: ${jobsErr.message}`);
 
-    // Per-keyword tally of scored fit/not-fit and unscored remaining.
-    const fitByKey = new Map<string, number>();
-    const notFitByKey = new Map<string, number>();
-    const remainingByKey = new Map<string, number>();
-    for (const j of (jobs ?? []) as {
+    const jobsForUser = (jobs ?? []) as {
       search_key: string | null;
       fit: boolean | null;
       fit_score: number | null;
-    }[]) {
-      const key = String(j.search_key ?? "general")
-        .trim()
-        .toLowerCase();
-      if (j.fit_score === null) {
-        remainingByKey.set(key, (remainingByKey.get(key) ?? 0) + 1);
-      } else if (j.fit === true) {
-        fitByKey.set(key, (fitByKey.get(key) ?? 0) + 1);
-      } else if (j.fit === false) {
-        notFitByKey.set(key, (notFitByKey.get(key) ?? 0) + 1);
-      }
-    }
+      updated_at: string | null;
+    }[];
 
     const batches: EvaluationBatchState[] = (rows ?? []).map((row) => {
       const key = String(row.keyword ?? "general")
         .trim()
         .toLowerCase();
+      const batchStart = row.created_at
+        ? new Date(row.created_at).getTime()
+        : 0;
+
+      let fit = 0;
+      let notFit = 0;
+      let remaining = 0;
+      for (const j of jobsForUser) {
+        if (
+          String(j.search_key ?? "general")
+            .trim()
+            .toLowerCase() !== key
+        )
+          continue;
+        const touched =
+          j.fit_score === null ||
+          (j.updated_at && new Date(j.updated_at).getTime() >= batchStart);
+        if (!touched) continue;
+        if (j.fit_score === null) remaining++;
+        else if (j.fit === true) fit++;
+        else if (j.fit === false) notFit++;
+      }
+
       return {
         id: String(row.id),
         keyword: String(row.keyword ?? "general"),
@@ -348,9 +363,9 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
         totalJobs: Number(row.total_jobs ?? 0),
         processedJobs: Number(row.processed_jobs ?? 0),
         failedJobs: Number(row.failed_jobs ?? 0),
-        fitJobs: fitByKey.get(key) ?? 0,
-        notFitJobs: notFitByKey.get(key) ?? 0,
-        remainingJobs: remainingByKey.get(key) ?? 0,
+        fitJobs: fit,
+        notFitJobs: notFit,
+        remainingJobs: remaining,
         lastError: row.last_error == null ? null : String(row.last_error),
       };
     });
