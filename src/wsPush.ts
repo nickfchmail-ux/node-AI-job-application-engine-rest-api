@@ -54,18 +54,18 @@ export function funnelFrom(counts: Record<string, number>) {
 
 /** One board's live state as sent to the frontend over the socket. */
 export interface BoardState {
-  scraped: number;      // listings found (live Redis counter)
-  duplicate: number;    // deduped (live Redis counter)
-  unique: number;       // scraped - duplicate
-  processing: number;   // jobs currently enriching (live Redis counter)
-  stage: string;        // pending | fetching | extracting | blocked | done | failed
+  scraped: number; // listings found (live Redis counter)
+  duplicate: number; // deduped (live Redis counter)
+  unique: number; // scraped - duplicate
+  processing: number; // jobs currently enriching (live Redis counter)
+  stage: string; // pending | fetching | extracting | blocked | done | failed
   pagesFetched: number; // search pages successfully fetched
-  pagesTotal: number;   // search pages requested
-  jobsFound: number;    // listings extracted (run_boards)
+  pagesTotal: number; // search pages requested
+  jobsFound: number; // listings extracted (run_boards)
   jobsProcessed: number; // jobs fully stored
-  jobsFailed: number;   // jobs that failed
+  jobsFailed: number; // jobs that failed
   lastError: string | null; // anti-bot / proxy failure detail
-  displayName: string;  // human-readable board name
+  displayName: string; // human-readable board name
 }
 
 /**
@@ -169,9 +169,7 @@ function mapStatusLabel(status: string | null): string | null {
  * This is the authoritative source for EACH board's search stage
  * (pending → fetching → extracting → done | blocked | failed).
  */
-async function getRunBoardDetail(
-  runId: string,
-): Promise<{
+async function getRunBoardDetail(runId: string): Promise<{
   rows: Record<string, unknown>[];
   requested: string[];
   status: string | null;
@@ -187,8 +185,10 @@ async function getRunBoardDetail(
           .eq("id", runId)
           .maybeSingle(),
       ]);
-    if (rowErr) console.warn(`[ws] run_boards(${runId}) failed: ${rowErr.message}`);
-    if (runErr) console.warn(`[ws] pipeline_runs(${runId}) failed: ${runErr.message}`);
+    if (rowErr)
+      console.warn(`[ws] run_boards(${runId}) failed: ${rowErr.message}`);
+    if (runErr)
+      console.warn(`[ws] pipeline_runs(${runId}) failed: ${runErr.message}`);
     return {
       rows: (rows ?? []) as Record<string, unknown>[],
       requested: ((run?.boards as string[]) ?? []) as string[],
@@ -268,7 +268,8 @@ export function boardsFrom(
   }
 
   // Ensure unique = scraped - duplicate per board.
-  for (const b of Object.values(boards)) b.unique = Math.max(0, b.scraped - b.duplicate);
+  for (const b of Object.values(boards))
+    b.unique = Math.max(0, b.scraped - b.duplicate);
   return boards;
 }
 
@@ -292,8 +293,10 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
           .eq("pipeline_run_id", runId)
           .order("created_at", { ascending: true }),
       ]);
-    if (runErr) console.warn(`[ws] evaluation run(${runId}) failed: ${runErr.message}`);
-    if (rowsErr) console.warn(`[ws] evaluation_runs(${runId}) failed: ${rowsErr.message}`);
+    if (runErr)
+      console.warn(`[ws] evaluation run(${runId}) failed: ${runErr.message}`);
+    if (rowsErr)
+      console.warn(`[ws] evaluation_runs(${runId}) failed: ${rowsErr.message}`);
 
     const batches: EvaluationBatchState[] = (rows ?? []).map((row) => ({
       id: String(row.id),
