@@ -70,7 +70,8 @@ export interface BoardState {
 
 /**
  * One keyword batch's live evaluation state, as sent to the frontend over
- * the socket. Mirrors the `evaluation_runs` row for the run.
+ * the socket. Mirrors the `evaluation_runs` row for the run, plus fit/not-fit
+ * counts derived from the run's scored `jobs`.
  */
 export interface EvaluationBatchState {
   id: string;
@@ -79,6 +80,12 @@ export interface EvaluationBatchState {
   totalJobs: number;
   processedJobs: number;
   failedJobs: number;
+  /** Jobs scored as a fit (fit = true). */
+  fitJobs: number;
+  /** Jobs scored as not a fit (fit = false, not null). */
+  notFitJobs: number;
+  /** Jobs still waiting to be scored (fit_score IS NULL). */
+  remainingJobs: number;
   lastError: string | null;
 }
 
@@ -93,6 +100,9 @@ export interface EvaluationState {
   totalJobs: number;
   processedJobs: number;
   failedJobs: number;
+  fitJobs: number;
+  notFitJobs: number;
+  remainingJobs: number;
   activeBatches: number;
   batches: EvaluationBatchState[];
 }
@@ -298,19 +308,59 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
     if (rowsErr)
       console.warn(`[ws] evaluation_runs(${runId}) failed: ${rowsErr.message}`);
 
-    const batches: EvaluationBatchState[] = (rows ?? []).map((row) => ({
-      id: String(row.id),
-      keyword: String(row.keyword ?? "general"),
-      status: String(row.status ?? "queued"),
-      totalJobs: Number(row.total_jobs ?? 0),
-      processedJobs: Number(row.processed_jobs ?? 0),
-      failedJobs: Number(row.failed_jobs ?? 0),
-      lastError: row.last_error == null ? null : String(row.last_error),
-    }));
+    // Fetch this run's jobs so we can compute fit / not-fit / remaining per
+    // batch. Fit counts come from the scored jobs; remaining = unscored.
+    const { data: jobs, error: jobsErr } = await supabase
+      .from("jobs")
+      .select("search_key, fit, fit_score")
+      .eq("pipeline_run_id", runId);
+    if (jobsErr) console.warn(`[ws] jobs(${runId}) failed: ${jobsErr.message}`);
+
+    // Per-keyword tally of scored fit/not-fit and unscored remaining.
+    const fitByKey = new Map<string, number>();
+    const notFitByKey = new Map<string, number>();
+    const remainingByKey = new Map<string, number>();
+    for (const j of (jobs ?? []) as {
+      search_key: string | null;
+      fit: boolean | null;
+      fit_score: number | null;
+    }[]) {
+      const key = String(j.search_key ?? "general")
+        .trim()
+        .toLowerCase();
+      if (j.fit_score === null) {
+        remainingByKey.set(key, (remainingByKey.get(key) ?? 0) + 1);
+      } else if (j.fit === true) {
+        fitByKey.set(key, (fitByKey.get(key) ?? 0) + 1);
+      } else if (j.fit === false) {
+        notFitByKey.set(key, (notFitByKey.get(key) ?? 0) + 1);
+      }
+    }
+
+    const batches: EvaluationBatchState[] = (rows ?? []).map((row) => {
+      const key = String(row.keyword ?? "general")
+        .trim()
+        .toLowerCase();
+      return {
+        id: String(row.id),
+        keyword: String(row.keyword ?? "general"),
+        status: String(row.status ?? "queued"),
+        totalJobs: Number(row.total_jobs ?? 0),
+        processedJobs: Number(row.processed_jobs ?? 0),
+        failedJobs: Number(row.failed_jobs ?? 0),
+        fitJobs: fitByKey.get(key) ?? 0,
+        notFitJobs: notFitByKey.get(key) ?? 0,
+        remainingJobs: remainingByKey.get(key) ?? 0,
+        lastError: row.last_error == null ? null : String(row.last_error),
+      };
+    });
 
     const totalJobs = batches.reduce((n, b) => n + b.totalJobs, 0);
     const processedJobs = batches.reduce((n, b) => n + b.processedJobs, 0);
     const failedJobs = batches.reduce((n, b) => n + b.failedJobs, 0);
+    const fitJobs = batches.reduce((n, b) => n + b.fitJobs, 0);
+    const notFitJobs = batches.reduce((n, b) => n + b.notFitJobs, 0);
+    const remainingJobs = batches.reduce((n, b) => n + b.remainingJobs, 0);
     const activeBatches = batches.filter(
       (b) => b.status === "queued" || b.status === "evaluating",
     ).length;
@@ -320,6 +370,9 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
       totalJobs,
       processedJobs,
       failedJobs,
+      fitJobs,
+      notFitJobs,
+      remainingJobs,
       activeBatches,
       batches,
     };
@@ -330,6 +383,9 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
       totalJobs: 0,
       processedJobs: 0,
       failedJobs: 0,
+      fitJobs: 0,
+      notFitJobs: 0,
+      remainingJobs: 0,
       activeBatches: 0,
       batches: [],
     };
@@ -364,6 +420,9 @@ async function buildStats(
         totalJobs: 0,
         processedJobs: 0,
         failedJobs: 0,
+        fitJobs: 0,
+        notFitJobs: 0,
+        remainingJobs: 0,
         activeBatches: 0,
         batches: [],
       },
