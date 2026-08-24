@@ -17,6 +17,83 @@
 
 import { ScrapedJob } from "./types";
 
+// ── URL canonicalization ───────────────────────────────────────────────────
+// URLs are the dedup key across runs (per-board `duplicate` counters and the
+// `jobs` unique constraint). Board parsers emit byte-exact raw hrefs that vary
+// run-over-run — tracking params, query order, trailing slash, host case — so
+// canonicalize BEFORE dedup AND before persistence to keep the match stable.
+// Pure + defensive: never throws, never crashes the pipeline.
+
+const TRACKING_PARAMS = new Set([
+  "utm_source",
+  "utm_medium",
+  "utm_campaign",
+  "utm_term",
+  "utm_content",
+  "gclid",
+  "fbclid",
+  "msclkid",
+  "ref",
+  "referrer",
+  "source",
+  "mc_cid",
+  "mc_eid",
+  "igshid",
+  "spm",
+  "scm",
+  "piwik_campaign",
+  "piwik_kwd",
+  "yclid",
+  "trk",
+  "trkCampaign",
+  "fbc",
+  "gbraid",
+  "wbraid",
+]);
+
+/**
+ * Canonicalize a URL so equal destinations compare equal:
+ * trims + cleanTexts input, lowercases the hostname, strips the default
+ * port, drops tracking/analytics query params, sorts remaining params,
+ * strips a trailing `/` (unless the path is exactly `/`), and drops the
+ * hash/fragment. Returns the canonical href — or the cleaned input unchanged
+ * when parsing fails (defensive: never crash the pipeline).
+ */
+export function canonicalizeUrl(raw: string | undefined | null): string {
+  const cleaned = cleanText(raw);
+  if (!cleaned) return "";
+  let url: URL;
+  try {
+    url = new URL(cleaned);
+  } catch {
+    return cleaned;
+  }
+  url.hostname = url.hostname.toLowerCase();
+  // Strip the default port (`:80` http / `:443` https).
+  const explicitPort =
+    url.port &&
+    !(
+      (url.protocol === "http:" && url.port === "80") ||
+      (url.protocol === "https:" && url.port === "443")
+    );
+  if (!explicitPort) url.port = "";
+
+  // Drop tracking/analytics params (case-insensitive), sort the rest.
+  const kept = [...url.searchParams.entries()]
+    .filter(([k]) => !TRACKING_PARAMS.has(k.toLowerCase()))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  url.search = kept.length > 0 ? `?${new URLSearchParams(kept).toString()}` : "";
+
+  // Strip a trailing `/` unless the path is exactly `/`.
+  if (url.pathname.length > 1 && url.pathname.endsWith("/")) {
+    url.pathname = url.pathname.slice(0, -1);
+  }
+
+  // Strip the hash/fragment entirely.
+  url.hash = "";
+  return url.href;
+}
+
 // ── HTML entity / tag cleaning ─────────────────────────────────────────────
 
 /** Decode common HTML entities + strip any residual tags, collapse whitespace. */
@@ -46,19 +123,50 @@ export function cleanText(
   return s;
 }
 
+/**
+ * Clean a company name for consistency. Just runs cleanText + collapses
+ * common recruiter prefixes ("Recruiter:", "via "), so the same fallback
+ * ("Unknown Company") applies across every board. Does NOT split on
+ * separators — that would corrupt legitimate names like "Deloitte - HK".
+ */
+export function cleanCompany(raw: string | undefined | null): string {
+  if (raw == null) return "";
+  let s = cleanText(raw);
+  if (!s) return "";
+  // Collapse a leading "Recruiter:" / "via <agency>" prefix when present.
+  s = s
+    .replace(/^(recruiter|agency|via)\s*[:\-–]\s*/i, "")
+    .replace(/^via\s+/i, "")
+    .trim();
+  return s;
+}
+
 // ── Posted date → ISO (YYYY-MM-DD) ─────────────────────────────────────────
 // Boards return one of:
-//   "3d ago", "53m ago", "30+ days ago", "Today", "Yesterday",
+//   "3d ago", "53m ago", "30+ days ago", "1 week ago", "Today", "Yesterday",
 //   "2026-08-19" (ISO), "2026-08-19T..." (ISO datetime)
+//   "2026-08-19 12:34" (datetime with a space) — CTgoodjobs detail pages
+//
+// The relative-date parser now accepts a LEADING date prefix too, so fields
+// like "2026-08-19 3d ago" still resolve (some boards concatenate a raw date
+// with a relative label).
 export function normalizePostedDate(
   raw: string | undefined,
 ): string | undefined {
   if (!raw) return undefined;
   const s = cleanText(raw).toLowerCase();
 
-  // Already ISO
-  const iso = raw.match(/(\d{4}-\d{2}-\d{2})/);
-  if (iso) return iso[1];
+  // Already ISO — support both "-" and "/" separators, plus datetime strings.
+  // A leading ISO always wins over any trailing relative label.
+  const iso = raw.match(
+    /(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/,
+  );
+  if (iso) {
+    const [y, m, d] = iso[1].split(/[-\/]/).map((p) => p.padStart(2, "0"));
+    const mm = m.slice(0, 2);
+    const dd = d.slice(0, 2);
+    return `${y}-${mm}-${dd}`;
+  }
 
   const now = new Date();
   const m = s.match(
@@ -324,10 +432,16 @@ export function normalizeJob(
   const board = opts.board ?? job.board ?? job.source ?? "unknown";
 
   const title = cleanText(job.title) || "Untitled";
-  const company = cleanText(job.company) || "Unknown Company";
+  // Company: some boards return a "brand · company" or "recruiter · company"
+  // combined string (OfferToday). Prefer the LAST segment after a separator —
+  // that's the hiring company, not the recruiter — and clean it.
+  const company = cleanCompany(job.company) || "Unknown Company";
   const location = normalizeLocation(job.location ?? opts.defaultLocation);
   const postedDate = normalizePostedDate(job.postedDate) ?? null;
-  const url = cleanText(job.url) || "";
+  // Canonicalize so `jobId: hashId(`${board}|${url}`)` and the persisted
+  // `url` are STABLE across runs (tracking params / query order / trailing
+  // slash / host case no longer break idempotency or per-board dedup).
+  const url = canonicalizeUrl(job.url);
   const description = job.description
     ? cleanText(job.description) || null
     : null;

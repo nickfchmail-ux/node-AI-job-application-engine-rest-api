@@ -187,6 +187,8 @@ export interface JobRow {
   expected_salary: string | null;
   user_id: string | null;
   status: string;
+  /** Failure detail when a job is retrying or failed. */
+  last_error: string | null;
   pipeline_run_id: string | null;
   board: string | null;
   resume_status: string | null;

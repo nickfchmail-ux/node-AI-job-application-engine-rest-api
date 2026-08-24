@@ -79,6 +79,8 @@ function getSender(queue: keyof typeof QUEUES): ServiceBusSender {
 /**
  * Send a message to a queue with duplicate-detection + TTL.
  * Returns the message id (used as azure_run_id for tracing).
+ * Guards against a hung sender with a timeout so HTTP triggers
+ * (POST /api/scrape) never hang on a dead Service Bus.
  */
 export async function enqueue(
   queue: keyof typeof QUEUES,
@@ -87,11 +89,17 @@ export async function enqueue(
 ): Promise<string> {
   const sender = getSender(queue);
   const messageId = opts.messageId ?? crypto.randomUUID();
-  await sender.sendMessages({
-    body,
-    messageId,
-    timeToLive: opts.ttlSeconds ? opts.ttlSeconds * 1000 : undefined, // ms
-  });
+  const timeoutMs = opts.ttlSeconds ? Math.min(opts.ttlSeconds * 1000, 30_000) : 30_000;
+  await Promise.race([
+    sender.sendMessages({
+      body,
+      messageId,
+      timeToLive: opts.ttlSeconds ? opts.ttlSeconds * 1000 : undefined, // ms
+    }),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Service Bus send timed out")), timeoutMs),
+    ),
+  ]);
   console.log(`[servicebus] enqueued ${messageId} → ${QUEUES[queue]}`);
   return messageId;
 }

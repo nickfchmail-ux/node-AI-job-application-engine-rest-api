@@ -40,3 +40,6 @@ ot_list.html
 supabase_insert.json
 poll.js
 azure/functions/jobsdb_direct.html
+
+# VS Code local editor config
+.vscode/

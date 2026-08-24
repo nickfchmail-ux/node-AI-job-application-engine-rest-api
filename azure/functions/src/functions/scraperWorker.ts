@@ -15,7 +15,11 @@ import { app, InvocationContext } from "@azure/functions";
 import { extractListings } from "../boardParsers";
 import { getBoardPattern } from "../boardRegistry";
 import { fetchBoardPage } from "../cloudflareProxy";
-import { applyNormalized, normalizeJobs } from "../normalize";
+import {
+  applyNormalized,
+  canonicalizeUrl,
+  normalizeJobs,
+} from "../normalize";
 import {
   fetchIndeedBatchDescriptionsApi,
   scrapeLinkedInApi,
@@ -209,17 +213,24 @@ async function runScraper(
       }),
     );
 
-    // Collect errors from this board's pages
+    // ── Collect errors from this board's pages ──
+    let boardBlocked = false;
+    let firstError: string | null = null;
     for (const r of results) {
       if (r.status === "rejected") {
-        boardErrors.push(`board ${board}: ${String(r.reason)}`);
+        const msg = `board ${board}: ${String(r.reason)}`;
+        boardErrors.push(msg);
+        if (!firstError) firstError = msg;
       } else if (!r.value.ok) {
         boardErrors.push(r.value.error);
-        // Hard anti-bot → mark board blocked
+        if (!firstError) firstError = r.value.error;
+        // Hard anti-bot → mark board blocked (retryable, not a hard fail)
         if (
           r.value.errorType === "blocked" ||
-          r.value.errorType === "challenge"
+          r.value.errorType === "challenge" ||
+          r.value.errorType === "rate_limited"
         ) {
+          boardBlocked = true;
           await markBoardBlocked(runId, board, r.value.error).catch(() => {});
         }
       }
@@ -228,16 +239,19 @@ async function runScraper(
     // ── Per-board state: done (or failed if it errored) ──
     const boardJobs = allJobs.filter((j) => j.board === board);
     if (boardJobs.length > 0) {
+      // Some pages may have failed while others succeeded → still done.
       await markBoardDone(runId, board, { jobs_found: boardJobs.length }).catch(
         () => {},
       );
-    } else if (boardErrors.some((e) => e.includes(`board ${board} `))) {
-      await markBoardFailed(
+    } else if (boardBlocked) {
+      // Already marked blocked above — ensure last_error is set.
+      await markBoardBlocked(
         runId,
         board,
-        boardErrors.find((e) => e.includes(`board ${board} `)) ??
-          "no jobs found",
+        firstError ?? "anti-bot block",
       ).catch(() => {});
+    } else if (firstError) {
+      await markBoardFailed(runId, board, firstError).catch(() => {});
     } else {
       await markBoardFailed(runId, board, "no jobs found on this board").catch(
         () => {},
@@ -262,24 +276,39 @@ async function runScraper(
     existingLoaded = true;
     let from = 0;
     const PAGE_SIZE = 1000;
-    for (;;) {
-      let query = supabase
-        .from("jobs")
-        .select("url, title, company")
-        .range(from, from + PAGE_SIZE - 1);
-      if (body.userId) {
-        query = query.eq("user_id", body.userId);
-      } else {
-        query = query.is("user_id", null);
+    try {
+      for (;;) {
+        let query = supabase
+          .from("jobs")
+          .select("url, title, company")
+          .range(from, from + PAGE_SIZE - 1);
+        if (body.userId) {
+          query = query.eq("user_id", body.userId);
+        } else {
+          query = query.is("user_id", null);
+        }
+        const { data, error } = await query;
+        if (error) {
+          // Non-fatal: if dedupe data can't load, proceed with an empty set
+          // (jobs may get duplicated but the run won't crash).
+          console.warn(
+            `[scraper] loadExisting failed (from=${from}): ${error.message}`,
+          );
+          break;
+        }
+        if (!data || data.length === 0) break;
+        for (const r of data) {
+          // Canonicalize stored URLs so the in-memory dedup set matches the
+          // canonical URLs the fan-out now produces (and persists).
+          const cu = canonicalizeUrl(r.url);
+          existingUrls.add(cu);
+          existingTitleCompany.set(`${r.title}|||${r.company}`, cu);
+        }
+        from += data.length;
+        if (data.length < PAGE_SIZE) break;
       }
-      const { data } = await query;
-      if (!data || data.length === 0) break;
-      for (const r of data) {
-        existingUrls.add(r.url);
-        existingTitleCompany.set(`${r.title}|||${r.company}`, r.url);
-      }
-      from += data.length;
-      if (data.length < PAGE_SIZE) break;
+    } catch (err) {
+      console.warn(`[scraper] loadExisting crashed: ${err}`);
     }
   };
 
@@ -289,6 +318,15 @@ async function runScraper(
   ): Promise<number> => {
     if (boardJobs.length === 0) return 0;
     await loadExisting();
+
+    // Canonicalize every URL BEFORE the dedup filter so the in-memory
+    // `existingUrls.has(...)` check AND the persisted `url` are stable
+    // across runs (tracking params / query order / trailing slash / host
+    // case no longer silently break the match). Canonicalization is pure
+    // and defensive — it never throws, and normalizeJob below re-applies it.
+    for (const j of boardJobs) {
+      j.url = canonicalizeUrl(j.url);
+    }
 
     const unique = boardJobs.filter((j) => {
       if (existingUrls.has(j.url)) return false;
@@ -300,7 +338,14 @@ async function runScraper(
       console.info(
         `[scraper] ${boardJobs[0].board} — skipped ${skipped} already-known job(s)`,
       );
-      await incrementCounters(body.userId, runId, { duplicate: skipped });
+      // Board-scoped counter — writes the per-board Redis key
+      // `{board}:duplicate` so the board chip's "Dup" column is correct.
+      await incrementCounters(
+        body.userId,
+        runId,
+        { duplicate: skipped },
+        boardJobs[0].board,
+      );
       await markBoardDone(runId, boardJobs[0].board, {
         duplicate: skipped,
       }).catch(() => {});
@@ -394,12 +439,19 @@ async function runScraper(
             keyword: body.keyword,
             search_key: body.keyword.toLowerCase().replace(/\s+/g, "_"),
             scraped_date: scrapedDate,
+            last_seen_at: new Date().toISOString(),
             status: "queued",
             board: job.board,
             pipeline_run_id: runId,
             user_id: body.userId || null,
           },
-          { onConflict: "url,scraped_date,user_id" },
+          {
+            onConflict: "url,user_id",
+            // Keep first-seen semantics: on conflict, DON'T overwrite
+            // scraped_date (first-seen folder name) — just refresh
+            // last_seen_at + status so cross-day re-searches dedupe.
+            ignoreDuplicates: false,
+          },
         )
         .then(({ error }) => {
           if (error)
@@ -434,7 +486,16 @@ async function runScraper(
         const board = boardQueue.shift()!;
         // Capture the board's own jobs snapshot (safely, since allJobs is shared)
         const before = allJobs.length;
-        await fetchOneBoard(board);
+        try {
+          await fetchOneBoard(board);
+        } catch (err) {
+          // A single board crashing must never kill the whole run — record
+          // the failure, mark the board failed, and continue with the rest.
+          const msg = `board ${board} crashed: ${err}`;
+          console.error(`[scraper] ${msg}`);
+          boardErrors.push(msg);
+          await markBoardFailed(runId, board, String(err)).catch(() => {});
+        }
         const boardJobs = allJobs
           .slice(before)
           .filter((j) => j.board === board);
@@ -450,9 +511,16 @@ async function runScraper(
   await Promise.all(boardWorkers);
 
   if (allJobs.length === 0) {
+    // Distinguish "every board was blocked / failed" (retryable) from a
+    // genuinely empty keyword (no matches anywhere).
+    const blockedCount = boardErrors.filter((e) =>
+      /blocked|challenge|rate_limited/.test(e),
+    ).length;
     const reason =
       boardErrors.length > 0
-        ? `All boards failed: ${boardErrors.join("; ")}`
+        ? blockedCount > 0
+          ? `Job boards were busy — ${blockedCount} of ${body.boards.length} boards couldn't be reached (anti-bot/rate-limit). Try again in a moment.`
+          : `All boards failed: ${boardErrors.join("; ")}`
         : "No jobs found for this keyword.";
     console.warn(`[scraper] run ${runId} — no jobs: ${reason}`);
     await markRunFailed(runId, reason);

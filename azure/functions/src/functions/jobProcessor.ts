@@ -17,6 +17,7 @@
 import { app, InvocationContext } from "@azure/functions";
 import { fetchJobDetail } from "../cloudflareProxy";
 import { enrichOneJob } from "../enrich";
+import { canonicalizeUrl } from "../normalize";
 import {
   fetchIndeedBatchDescriptionsApi,
   fetchLinkedInDescriptionApi,
@@ -31,6 +32,34 @@ import {
 } from "../supabase";
 import type { JobMessage } from "../types";
 
+/**
+ * Classify an error as TRANSIENT (upstream / network / anti-bot — retryable
+ * via Service Bus redelivery) vs FATAL (bad data on our side — fail fast).
+ * This is what keeps the run from being prematurely marked completed/failed
+ * when a board or proxy has a hiccup.
+ */
+function isTransientError(err: unknown): boolean {
+  const msg = String((err as Error)?.message ?? err).toLowerCase();
+  const transient = [
+    "timeout",
+    "abort",
+    "econnreset",
+    "econnrefused",
+    "eai_again",
+    "socket hang up",
+    "fetch failed",
+    "upstream",
+    "rate_limit",
+    "blocked",
+    "challenge",
+    "dead-letter",
+    "etimedout",
+    "enotfound",
+    "unexpected token", // a proxy returned HTML where we expected JSON
+  ];
+  return transient.some((t) => msg.includes(t));
+}
+
 app.serviceBusQueue("jobs", {
   queueName: "jobs",
   connection: "ServiceBus",
@@ -38,6 +67,12 @@ app.serviceBusQueue("jobs", {
     const body = rawBody as JobMessage;
     const { jobId, runId, userId, board, scrapedJob, keyword, scrapedDate } =
       body;
+
+    // Canonicalize the job URL ONCE for the whole handler so every side
+    // effect (status-by-url, the upsert row, the retrying/failed updates)
+    // uses a stable URL. Defensive: the manual re-process path rebuilds
+    // scrapedJob from the DB, and the scraper path is already canonical.
+    const url = canonicalizeUrl(scrapedJob.url);
 
     console.info(
       `[processor] job ${jobId} (${board}): "${scrapedJob.title}" @ ${scrapedJob.company} [run ${runId}]`,
@@ -47,7 +82,7 @@ app.serviceBusQueue("jobs", {
       // ── 0. Mark job as processing (Realtime streams this) ──
       // Match by URL — the message jobId is a random UUID, not the
       // DB row id. The scraper pre-inserted the row with this URL.
-      await updateJobStatusByUrl(scrapedJob.url, "processing", {
+      await updateJobStatusByUrl(url, "processing", {
         processing_started_at: new Date().toISOString(),
       });
       // Redis: track processing as a LIVE counter (incremented here,
@@ -136,7 +171,7 @@ app.serviceBusQueue("jobs", {
         salary_currency: enriched._normSalary?.currency ?? null,
         salary_confidence: enriched._normSalary?.confidence ?? null,
         posted_date: enriched._normPostedDate ?? enriched.postedDate ?? null,
-        url: enriched.url,
+        url,
         short_description: enriched.description ?? null,
         keyword,
         search_key: keyword.toLowerCase().replace(/\s+/g, "_"),
@@ -176,7 +211,16 @@ app.serviceBusQueue("jobs", {
 
       const { data: upserted, error } = await supabase
         .from("jobs")
-        .upsert(row, { onConflict: "url,scraped_date,user_id" })
+        .upsert(
+          { ...row, last_seen_at: new Date().toISOString() },
+          {
+            onConflict: "url,user_id",
+            // Date-independent dedup: same URL + user = ONE row. On
+            // conflict, refresh last_seen_at but keep scraped_date
+            // (first-seen) intact.
+            ignoreDuplicates: false,
+          },
+        )
         .select("id");
 
       if (error) {
@@ -202,19 +246,37 @@ app.serviceBusQueue("jobs", {
         `[processor] ✓ job ${jobId} done — scraped & stored ("${enriched.title}" @ ${enriched.company})`,
       );
     } catch (err) {
-      console.error(`[processor] job ${jobId} failed: ${err}`);
-      await updateJobStatusByUrl(scrapedJob.url, "failed", {
-        processing_completed_at: new Date().toISOString(),
-      }).catch(() => {});
-      // Redis: decrement the live processing counter on failure too
+      const transient = isTransientError(err);
+      console.error(
+        `[processor] job ${jobId} failed (${transient ? "transient — will retry" : "fatal"}): ${err}`,
+      );
+      // Redis: decrement the live processing counter on failure too.
       await incrementCounters(userId, runId, { processing: -1 }, board);
-      // Per-board: count the failed job
+      // Per-board: count the failed job.
       await bumpRunBoardCounts(runId, board, { jobs_failed: 1 }).catch(
         () => {},
       );
+
+      if (transient) {
+        // ── Transient upstream error: mark job RETRYING (NOT failed) so the
+        // run isn't prematurely completed, and rethrow so Service Bus
+        // redelivers (at-least-once, up to maxDeliveryCount). If a later
+        // delivery succeeds, the upsert flips the row to completed.
+        await updateJobStatusByUrl(url, "retrying", {
+          last_error: String(err).slice(0, 500),
+          processing_completed_at: new Date().toISOString(),
+        }).catch(() => {});
+        throw err;
+      }
+
+      // ── Fatal error (bad data on our side): fail fast — mark failed and
+      // complete the message so we don't burn the remaining deliveries.
+      await updateJobStatusByUrl(url, "failed", {
+        last_error: String(err).slice(0, 500),
+        processing_completed_at: new Date().toISOString(),
+      }).catch(() => {});
       // If all jobs for this run are now terminal, mark the run completed
       await finalizeRunIfDone(runId, console.log).catch(() => {});
-      throw err; // rethrow → Service Bus delivers again (at-least-once) up to maxDeliveryCount
     }
   },
 });

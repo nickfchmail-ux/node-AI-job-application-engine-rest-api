@@ -20,3 +20,4 @@ END $$;
 -- Add tables to the realtime publication (idempotent)
 ALTER PUBLICATION supabase_realtime ADD TABLE jobs;
 ALTER PUBLICATION supabase_realtime ADD TABLE pipeline_runs;
+   

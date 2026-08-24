@@ -136,6 +136,8 @@ function parseJobsDbHtml(html: string, board: string): ScrapedJob[] {
       const url = relPath.startsWith("http")
         ? relPath
         : `${BASE_URL_JOBSDB}${relPath}`;
+      const description =
+        job.teaser || job.abstract || job.jobDescription || job.description;
       results.push({
         title: job.title || job.jobTitle || "N/A",
         company:
@@ -147,7 +149,7 @@ function parseJobsDbHtml(html: string, board: string): ScrapedJob[] {
           job.suburb || job.location?.label || job.locationLabel || "Hong Kong",
         salary: job.salary || job.salaryLabel || undefined,
         postedDate: job.listingDate || job.postedAt || undefined,
-        description: job.teaser || job.abstract || undefined,
+        description,
         url,
       });
     }

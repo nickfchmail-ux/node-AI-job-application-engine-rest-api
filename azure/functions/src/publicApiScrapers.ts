@@ -48,6 +48,11 @@ interface OfferTodayItem {
 
 function parsePostTime(raw?: string): string | undefined {
   if (!raw) return undefined;
+  // Already an ISO / date string — pass through as YYYY-MM-DD.
+  const iso = raw.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (iso) {
+    return `${iso[1]}-${iso[2].padStart(2, "0")}-${iso[3].padStart(2, "0")}`;
+  }
   const m = raw.match(/(\d+)\s*(day|month|week|hour|minute)/i);
   if (!m) return undefined;
   const n = parseInt(m[1], 10);
@@ -152,6 +157,8 @@ export async function fetchOfferTodayDescriptionApi(
         jobDetail?: string;
         description?: string;
         jobRequirement?: string;
+        /** Translated (English) description — preferred like the legacy scraper. */
+        translateJobDesc?: string;
       };
     };
     if (json.code !== 0) {
@@ -159,6 +166,7 @@ export async function fetchOfferTodayDescriptionApi(
       return null;
     }
     const desc =
+      json.data?.translateJobDesc ||
       json.data?.jobDesc ||
       json.data?.jobDetail ||
       json.data?.description ||
@@ -236,6 +244,11 @@ function parseLinkedInListingHtml(html: string): ScrapedJob[] {
       /job-search-card__location[^>]*>\s*([\s\S]*?)\s*<\/span>/,
     );
     const dateMatch = card.match(/datetime="(\d{4}-\d{2}-\d{2})"/);
+    // LinkedIn's guest listing sometimes includes a salary line on the card.
+    const salary = extractText(
+      card,
+      /job-search-card__salary-info[^>]*>\s*([\s\S]*?)\s*<\/span>/,
+    );
     if (!title || !company) continue;
     jobs.push({
       board: "linkedin",
@@ -244,6 +257,7 @@ function parseLinkedInListingHtml(html: string): ScrapedJob[] {
       location: location || "Hong Kong",
       url: `https://www.linkedin.com/jobs/view/${jobId}`,
       postedDate: dateMatch?.[1],
+      salary: salary || undefined,
     });
   }
   return jobs;

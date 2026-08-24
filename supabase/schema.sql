@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   url              TEXT        NOT NULL,
   short_description TEXT,
   keyword          TEXT        NOT NULL,  -- search keyword used, e.g. "web_developer"
-  scraped_date     DATE        NOT NULL,  -- YYYY-MM-DD folder name
+  scraped_date     DATE        NOT NULL,  -- YYYY-MM-DD folder name (FIRST-seen date)
+  last_seen_at     TIMESTAMPTZ,           -- last time this URL was seen for this user
 
   -- ── Parsed job details ──────────────────────────────────
   responsibilities JSONB       NOT NULL DEFAULT '[]',
@@ -41,8 +42,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-  -- same job URL scraped by the same user on the same date = same record
-  UNIQUE NULLS NOT DISTINCT (url, scraped_date, user_id)
+  -- same job URL scraped by the same user = same record (regardless of day)
+  -- scraped_date is kept as the first-seen folder name; last_seen_at tracks
+  -- the most recent sighting so cross-day re-searches dedupe to one row.
+  UNIQUE NULLS NOT DISTINCT (url, user_id)
 );
 
 -- Auto-update updated_at on every row change
@@ -60,6 +63,7 @@ CREATE TRIGGER jobs_updated_at
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Useful indexes
+CREATE INDEX IF NOT EXISTS idx_jobs_url_user      ON jobs (url, user_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_scraped_date ON jobs (scraped_date);
 CREATE INDEX IF NOT EXISTS idx_jobs_keyword      ON jobs (keyword);
 CREATE INDEX IF NOT EXISTS idx_jobs_fit          ON jobs (fit);

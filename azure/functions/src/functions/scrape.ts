@@ -130,8 +130,22 @@ app.http("scrape", {
       });
     } catch (err) {
       console.error(`[scrape] Service Bus enqueue failed: ${err}`);
+      // The run row exists but never got queued — leave it in `queued` with a
+      // last_error so the user sees something actionable on the run page.
+      try {
+        await supabase
+          .from("pipeline_runs")
+          .update({
+            status: "failed",
+            last_error: `Failed to start scrape: ${String(err).slice(0, 500)}`,
+            completed_at: new Date().toISOString(),
+          })
+          .eq("id", runId);
+      } catch {
+        // non-fatal — best-effort cleanup
+      }
       return {
-        status: 500,
+        status: 503,
         jsonBody: { error: "enqueue failed", detail: String(err) },
       };
     }

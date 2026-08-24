@@ -69,6 +69,35 @@ export interface BoardState {
 }
 
 /**
+ * One keyword batch's live evaluation state, as sent to the frontend over
+ * the socket. Mirrors the `evaluation_runs` row for the run.
+ */
+export interface EvaluationBatchState {
+  id: string;
+  keyword: string;
+  status: string; // queued | evaluating | completed | failed
+  totalJobs: number;
+  processedJobs: number;
+  failedJobs: number;
+  lastError: string | null;
+}
+
+/**
+ * The evaluation portion of the socket payload: overall run state + the
+ * per-keyword batches. The frontend uses this to render the "Matching jobs
+ * to your resume…" panel live over WebSocket (Supabase Realtime remains a
+ * fallback for individual row changes).
+ */
+export interface EvaluationState {
+  status: string; // none | queued | evaluating | completed | failed
+  totalJobs: number;
+  processedJobs: number;
+  failedJobs: number;
+  activeBatches: number;
+  batches: EvaluationBatchState[];
+}
+
+/**
  * The SIMPLIFIED unified payload the frontend receives on ONE "stats" event.
  * Everything the dashboard needs in a single flat object.
  */
@@ -86,6 +115,8 @@ export interface StatsPayload {
   status: string | null;
   /** Human-friendly status copy. */
   statusLabel: string | null;
+  /** AI evaluation state for this run (present even when not evaluating). */
+  evaluation: EvaluationState;
 }
 
 const BOARD_DISPLAY: Record<string, string> = {
@@ -242,6 +273,67 @@ export function boardsFrom(
 }
 
 /**
+ * Read the run's AI evaluation state: the overall `evaluation_status` from
+ * `pipeline_runs` plus each keyword batch from `evaluation_runs`.
+ */
+async function getEvaluationState(runId: string): Promise<EvaluationState> {
+  try {
+    const supabase = getSupabaseClient();
+    const [{ data: run, error: runErr }, { data: rows, error: rowsErr }] =
+      await Promise.all([
+        supabase
+          .from("pipeline_runs")
+          .select("evaluation_status")
+          .eq("id", runId)
+          .maybeSingle(),
+        supabase
+          .from("evaluation_runs")
+          .select("*")
+          .eq("pipeline_run_id", runId)
+          .order("created_at", { ascending: true }),
+      ]);
+    if (runErr) console.warn(`[ws] evaluation run(${runId}) failed: ${runErr.message}`);
+    if (rowsErr) console.warn(`[ws] evaluation_runs(${runId}) failed: ${rowsErr.message}`);
+
+    const batches: EvaluationBatchState[] = (rows ?? []).map((row) => ({
+      id: String(row.id),
+      keyword: String(row.keyword ?? "general"),
+      status: String(row.status ?? "queued"),
+      totalJobs: Number(row.total_jobs ?? 0),
+      processedJobs: Number(row.processed_jobs ?? 0),
+      failedJobs: Number(row.failed_jobs ?? 0),
+      lastError: row.last_error == null ? null : String(row.last_error),
+    }));
+
+    const totalJobs = batches.reduce((n, b) => n + b.totalJobs, 0);
+    const processedJobs = batches.reduce((n, b) => n + b.processedJobs, 0);
+    const failedJobs = batches.reduce((n, b) => n + b.failedJobs, 0);
+    const activeBatches = batches.filter(
+      (b) => b.status === "queued" || b.status === "evaluating",
+    ).length;
+
+    return {
+      status: String(run?.evaluation_status ?? "none"),
+      totalJobs,
+      processedJobs,
+      failedJobs,
+      activeBatches,
+      batches,
+    };
+  } catch (err) {
+    console.warn(`[ws] getEvaluationState(${runId}) failed: ${err}`);
+    return {
+      status: "none",
+      totalJobs: 0,
+      processedJobs: 0,
+      failedJobs: 0,
+      activeBatches: 0,
+      batches: [],
+    };
+  }
+}
+
+/**
  * Build the unified "stats" payload for a user + optional run.
  * When runId is omitted, uses the latest run (so connect always
  * delivers everything the dashboard needs in ONE event).
@@ -264,13 +356,22 @@ async function buildStats(
       boards: {},
       status: null,
       statusLabel: null,
+      evaluation: {
+        status: "none",
+        totalJobs: 0,
+        processedJobs: 0,
+        failedJobs: 0,
+        activeBatches: 0,
+        batches: [],
+      },
     };
   }
 
-  const [runCounts, boardCounts, detail] = await Promise.all([
+  const [runCounts, boardCounts, detail, evaluation] = await Promise.all([
     getRunCounts(userId, targetRun),
     getRunBoardCounts(userId, targetRun),
     getRunBoardDetail(targetRun),
+    getEvaluationState(targetRun),
   ]);
 
   return {
@@ -281,6 +382,7 @@ async function buildStats(
     boards: boardsFrom(boardCounts, detail.rows, detail.requested),
     status: detail.status,
     statusLabel: mapStatusLabel(detail.status),
+    evaluation,
   };
 }
 
