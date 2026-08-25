@@ -528,3 +528,60 @@ export async function pushStats(userId: string, runId?: string): Promise<void> {
     console.warn(`[ws] pushStats(${userId}/${runId}) failed: ${err}`);
   }
 }
+
+/**
+ * Push the CURRENT STATE OF ONE JOB to a user's room as a `job:state` event.
+ *
+ * The evaluator's document workers call the `/webhook/state` endpoint with
+ * `{ userId, jobId, scope: "job" }` when a tailored resume or cover letter
+ * completes/fails. The backend reads the job row (scoped to the owner) and
+ * emits a compact object so the job detail page updates instantly without
+ * polling. Supabase Realtime remains the fallback for row changes.
+ */
+export interface JobStatePayload {
+  ok: boolean;
+  jobId: string;
+  fit: boolean | null;
+  fit_score: number | null;
+  resume_status: string | null;
+  resume_url: string | null;
+  cover_letter_status: string | null;
+  cover_letter: string | null;
+}
+
+export async function pushJobState(
+  userId: string,
+  jobId: string,
+): Promise<void> {
+  if (!io || !userId || !jobId) return;
+  try {
+    const supabase = getSupabaseClient();
+    const { data, error } = await supabase
+      .from("jobs")
+      .select(
+        "fit, fit_score, resume_status, resume_url, cover_letter_status, cover_letter",
+      )
+      .eq("id", jobId)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (error) {
+      console.warn(`[ws] pushJobState(${jobId}) read failed: ${error.message}`);
+      return;
+    }
+    if (!data) return; // job not found or not owned → emit nothing
+
+    const payload: JobStatePayload = {
+      ok: true,
+      jobId,
+      fit: (data.fit as boolean | null) ?? null,
+      fit_score: (data.fit_score as number | null) ?? null,
+      resume_status: (data.resume_status as string | null) ?? null,
+      resume_url: (data.resume_url as string | null) ?? null,
+      cover_letter_status: (data.cover_letter_status as string | null) ?? null,
+      cover_letter: (data.cover_letter as string | null) ?? null,
+    };
+    io.to(`user:${userId}`).emit("job:state", payload);
+  } catch (err) {
+    console.warn(`[ws] pushJobState(${userId}/${jobId}) failed: ${err}`);
+  }
+}
