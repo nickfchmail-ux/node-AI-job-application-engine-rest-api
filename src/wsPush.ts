@@ -75,6 +75,8 @@ export interface BoardState {
  */
 export interface EvaluationBatchState {
   id: string;
+  /** The pipeline_runs.id this batch belongs to (scopes the batch to a run). */
+  pipelineRunId: string | null;
   keyword: string;
   status: string; // queued | evaluating | completed | failed
   totalJobs: number;
@@ -339,6 +341,9 @@ async function collectEvaluationBatches(
 
     return {
       id: String(row.id),
+      pipelineRunId: row.pipeline_run_id
+        ? String(row.pipeline_run_id)
+        : null,
       keyword: String(row.keyword ?? "general"),
       status: String(row.status ?? "queued"),
       totalJobs: Number(row.total_jobs ?? 0),
