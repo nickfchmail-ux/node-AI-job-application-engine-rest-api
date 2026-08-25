@@ -89,6 +89,8 @@ export interface EvaluationBatchState {
   /** Jobs still waiting to be scored (fit_score IS NULL). */
   remainingJobs: number;
   lastError: string | null;
+  /** ISO timestamp of the last update (used to detect stale active batches). */
+  updatedAt?: string;
 }
 
 /**
@@ -353,6 +355,7 @@ async function collectEvaluationBatches(
       notFitJobs: notFit,
       remainingJobs: remaining,
       lastError: row.last_error == null ? null : String(row.last_error),
+      updatedAt: row.updated_at ? String(row.updated_at) : undefined,
     };
   });
 }
@@ -403,11 +406,24 @@ async function getUserEvaluationState(
       userId,
       (rows ?? []) as Record<string, unknown>[],
     );
-    // Overall status: evaluating if any batch is active, completed if all
-    // done and something was processed, else "none"/"failed".
-    const anyActive = batches.some(
-      (b) => b.status === "queued" || b.status === "evaluating",
-    );
+    // A batch only counts as ACTIVE if it is queued/evaluating AND was updated
+    // recently. A batch stuck in "evaluating" for a long time (e.g. the worker
+    // died mid-run, or a stale row from a previous session) must NOT keep the
+    // whole account-wide status at "evaluating" — that made the match panel
+    // show "Starting your match…" forever after a page refresh even though the
+    // user's actual match had finished.
+    const now = Date.now();
+    const STALE_MS = 10 * 60 * 1000; // 10 minutes
+    const isActive = (b: EvaluationBatchState): boolean => {
+      if (b.status !== "queued" && b.status !== "evaluating") return false;
+      const updatedAt = (b as { updatedAt?: string }).updatedAt;
+      if (updatedAt) {
+        const t = new Date(updatedAt).getTime();
+        if (!Number.isNaN(t) && now - t > STALE_MS) return false;
+      }
+      return true;
+    };
+    const anyActive = batches.some(isActive);
     const anyProcessed = batches.some(
       (b) => b.status === "completed" && b.processedJobs > 0,
     );
@@ -418,7 +434,10 @@ async function getUserEvaluationState(
         : anyProcessed
           ? "completed"
           : "failed";
-    return summarizeBatches(batches, status);
+    const state = summarizeBatches(batches, status);
+    // activeBatches should reflect only genuinely-active batches, not stale ones.
+    state.activeBatches = batches.filter(isActive).length;
+    return state;
   } catch (err) {
     console.warn(`[ws] getUserEvaluationState(${userId}) failed: ${err}`);
     return {
