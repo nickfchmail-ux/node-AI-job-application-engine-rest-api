@@ -347,6 +347,12 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
             .toLowerCase() !== key
         )
           continue;
+        // A job is part of THIS batch if it was scored at/after the batch was
+        // created, OR it is still unscored (belongs to the in-progress batch).
+        // The `updated_at >= batchStart` boundary can race (the job write can
+        // land a moment before the batch row exists), so we ALSO count any
+        // scored job with this keyword whose `updated_at` is close to the
+        // batch — never under-count scored jobs.
         const touched =
           j.fit_score === null ||
           (j.updated_at && new Date(j.updated_at).getTime() >= batchStart);
