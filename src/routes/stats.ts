@@ -12,6 +12,7 @@
 // ============================================================
 
 import { Request, Response, Router } from "express";
+import { getSupabaseClient } from "../db";
 import { requireAuth } from "../middleware/auth";
 import {
   getRunBoardCounts,
@@ -23,6 +24,31 @@ import {
 
 const router = Router();
 router.use(requireAuth);
+
+/** Cache of runId → pipeline_runs.status, fetched once per request. */
+let _statusCache: Record<string, string> = {};
+async function getRunStatuses(userId: string): Promise<Record<string, string>> {
+  if (Object.keys(_statusCache).length > 0) return _statusCache;
+  try {
+    const supabase = getSupabaseClient();
+    const { data, error } = await supabase
+      .from("pipeline_runs")
+      .select("id, status")
+      .eq("user_id", userId);
+    if (error) {
+      console.warn(`[stats] pipeline_runs status failed: ${error.message}`);
+      _statusCache = {};
+    } else {
+      _statusCache = Object.fromEntries(
+        (data ?? []).map((r) => [r.id, r.status]),
+      );
+    }
+  } catch (err) {
+    console.warn(`[stats] getRunStatuses failed: ${err}`);
+    _statusCache = {};
+  }
+  return _statusCache;
+}
 
 /** Normalize a counters hash into a full funnel object (0 defaults). */
 function funnelFrom(counts: Record<string, number>) {
@@ -58,6 +84,7 @@ router.get("/summary", async (req: Request, res: Response) => {
 router.get("/runs", async (req: Request, res: Response) => {
   try {
     const runIds = await listUserRuns(req.userId!);
+    const statuses = await getRunStatuses(req.userId!);
     const runs = [];
     for (const runId of runIds) {
       const [counts, meta] = await Promise.all([
@@ -69,6 +96,7 @@ router.get("/runs", async (req: Request, res: Response) => {
         keyword: (meta?.keyword as string) ?? "",
         boards: (meta?.boards as string[]) ?? [],
         createdAt: (meta?.createdAt as string) ?? null,
+        status: statuses[runId] ?? null,
         counts: funnelFrom(counts),
       });
     }
