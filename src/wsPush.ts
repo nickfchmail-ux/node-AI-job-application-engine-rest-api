@@ -284,8 +284,156 @@ export function boardsFrom(
 }
 
 /**
+ * Compute the per-keyword fit / not-fit / remaining counts from a user's
+ * jobs, for every evaluation batch. Shared by the run-scoped and the
+ * account-wide variants.
+ */
+async function collectEvaluationBatches(
+  userId: string | null,
+  rows: Record<string, unknown>[],
+): Promise<EvaluationBatchState[]> {
+  if (!userId) return [];
+  const supabase = getSupabaseClient();
+  const { data: jobs, error: jobsErr } = await supabase
+    .from("jobs")
+    .select("search_key, fit, fit_score, updated_at")
+    .eq("user_id", userId)
+    .in("status", ["completed", "analysed"]);
+  if (jobsErr) console.warn(`[ws] jobs failed: ${jobsErr.message}`);
+
+  const jobsForUser = (jobs ?? []) as {
+    search_key: string | null;
+    fit: boolean | null;
+    fit_score: number | null;
+    updated_at: string | null;
+  }[];
+
+  return (rows ?? []).map((row) => {
+    const key = String(row.keyword ?? "general")
+      .trim()
+      .toLowerCase();
+    const batchStart = row.created_at
+      ? new Date(row.created_at as string).getTime()
+      : 0;
+
+    let fit = 0;
+    let notFit = 0;
+    let remaining = 0;
+    for (const j of jobsForUser) {
+      if (
+        String(j.search_key ?? "general")
+          .trim()
+          .toLowerCase() !== key
+      )
+        continue;
+      // A job is part of THIS batch if it was scored at/after the batch was
+      // created, OR it is still unscored (belongs to the in-progress batch).
+      const touched =
+        j.fit_score === null ||
+        (j.updated_at && new Date(j.updated_at).getTime() >= batchStart);
+      if (!touched) continue;
+      if (j.fit_score === null) remaining++;
+      else if (j.fit === true) fit++;
+      else if (j.fit === false) notFit++;
+    }
+
+    return {
+      id: String(row.id),
+      keyword: String(row.keyword ?? "general"),
+      status: String(row.status ?? "queued"),
+      totalJobs: Number(row.total_jobs ?? 0),
+      processedJobs: Number(row.processed_jobs ?? 0),
+      failedJobs: Number(row.failed_jobs ?? 0),
+      fitJobs: fit,
+      notFitJobs: notFit,
+      remainingJobs: remaining,
+      lastError: row.last_error == null ? null : String(row.last_error),
+    };
+  });
+}
+
+/** Sum an EvaluationBatchState[] into the flattened EvaluationState fields. */
+function summarizeBatches(
+  batches: EvaluationBatchState[],
+  status: string,
+): EvaluationState {
+  return {
+    status,
+    totalJobs: batches.reduce((n, b) => n + b.totalJobs, 0),
+    processedJobs: batches.reduce((n, b) => n + b.processedJobs, 0),
+    failedJobs: batches.reduce((n, b) => n + b.failedJobs, 0),
+    fitJobs: batches.reduce((n, b) => n + b.fitJobs, 0),
+    notFitJobs: batches.reduce((n, b) => n + b.notFitJobs, 0),
+    remainingJobs: batches.reduce((n, b) => n + b.remainingJobs, 0),
+    activeBatches: batches.filter(
+      (b) => b.status === "queued" || b.status === "evaluating",
+    ).length,
+    batches,
+  };
+}
+
+/**
+ * The user's ACCOUNT-WIDE evaluation state — every keyword batch across all
+ * their runs, with fit/not-fit/remaining computed from their jobs. This is
+ * the source of truth for the "Matching jobs to your resume" panel: a
+ * search-key evaluation spans multiple runs, so scoping to one run would
+ * silently hide completed batches (the symptom behind "still no fit / not
+ * fit"). Used on connect and on every stats push.
+ */
+async function getUserEvaluationState(
+  userId: string,
+): Promise<EvaluationState> {
+  try {
+    const supabase = getSupabaseClient();
+    const { data: rows, error: rowsErr } = await supabase
+      .from("evaluation_runs")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true });
+    if (rowsErr)
+      console.warn(
+        `[ws] evaluation_runs(user ${userId}) failed: ${rowsErr.message}`,
+      );
+    const batches = await collectEvaluationBatches(
+      userId,
+      (rows ?? []) as Record<string, unknown>[],
+    );
+    // Overall status: evaluating if any batch is active, completed if all
+    // done and something was processed, else "none"/"failed".
+    const anyActive = batches.some(
+      (b) => b.status === "queued" || b.status === "evaluating",
+    );
+    const anyProcessed = batches.some(
+      (b) => b.status === "completed" && b.processedJobs > 0,
+    );
+    const status = anyActive
+      ? "evaluating"
+      : batches.length === 0
+        ? "none"
+        : anyProcessed
+          ? "completed"
+          : "failed";
+    return summarizeBatches(batches, status);
+  } catch (err) {
+    console.warn(`[ws] getUserEvaluationState(${userId}) failed: ${err}`);
+    return {
+      status: "none",
+      totalJobs: 0,
+      processedJobs: 0,
+      failedJobs: 0,
+      fitJobs: 0,
+      notFitJobs: 0,
+      remainingJobs: 0,
+      activeBatches: 0,
+      batches: [],
+    };
+  }
+}
+
+/**
  * Read the run's AI evaluation state: the overall `evaluation_status` from
- * `pipeline_runs` plus each keyword batch from `evaluation_runs`.
+ * `pipeline_runs` plus each keyword batch from `evaluation_runs`. Kept for
+ * run-scoped consumers; the socket uses the account-wide variant below.
  */
 async function getEvaluationState(runId: string): Promise<EvaluationState> {
   try {
@@ -307,96 +455,12 @@ async function getEvaluationState(runId: string): Promise<EvaluationState> {
       console.warn(`[ws] evaluation run(${runId}) failed: ${runErr.message}`);
     if (rowsErr)
       console.warn(`[ws] evaluation_runs(${runId}) failed: ${rowsErr.message}`);
-    const userId = run?.user_id;
-
-    // Fetch the user's jobs (account-wide) so fit / not-fit / remaining match
-    // the batch total even when the batch spans multiple runs. A job counts
-    // toward a batch if it was touched by that batch (scored at/after the
-    // batch's created_at, or still unscored).
-    const { data: jobs, error: jobsErr } = userId
-      ? await supabase
-          .from("jobs")
-          .select("search_key, fit, fit_score, updated_at")
-          .eq("user_id", userId)
-          .in("status", ["completed", "analysed"])
-      : { data: null, error: null };
-    if (jobsErr) console.warn(`[ws] jobs(${runId}) failed: ${jobsErr.message}`);
-
-    const jobsForUser = (jobs ?? []) as {
-      search_key: string | null;
-      fit: boolean | null;
-      fit_score: number | null;
-      updated_at: string | null;
-    }[];
-
-    const batches: EvaluationBatchState[] = (rows ?? []).map((row) => {
-      const key = String(row.keyword ?? "general")
-        .trim()
-        .toLowerCase();
-      const batchStart = row.created_at
-        ? new Date(row.created_at).getTime()
-        : 0;
-
-      let fit = 0;
-      let notFit = 0;
-      let remaining = 0;
-      for (const j of jobsForUser) {
-        if (
-          String(j.search_key ?? "general")
-            .trim()
-            .toLowerCase() !== key
-        )
-          continue;
-        // A job is part of THIS batch if it was scored at/after the batch was
-        // created, OR it is still unscored (belongs to the in-progress batch).
-        // The `updated_at >= batchStart` boundary can race (the job write can
-        // land a moment before the batch row exists), so we ALSO count any
-        // scored job with this keyword whose `updated_at` is close to the
-        // batch — never under-count scored jobs.
-        const touched =
-          j.fit_score === null ||
-          (j.updated_at && new Date(j.updated_at).getTime() >= batchStart);
-        if (!touched) continue;
-        if (j.fit_score === null) remaining++;
-        else if (j.fit === true) fit++;
-        else if (j.fit === false) notFit++;
-      }
-
-      return {
-        id: String(row.id),
-        keyword: String(row.keyword ?? "general"),
-        status: String(row.status ?? "queued"),
-        totalJobs: Number(row.total_jobs ?? 0),
-        processedJobs: Number(row.processed_jobs ?? 0),
-        failedJobs: Number(row.failed_jobs ?? 0),
-        fitJobs: fit,
-        notFitJobs: notFit,
-        remainingJobs: remaining,
-        lastError: row.last_error == null ? null : String(row.last_error),
-      };
-    });
-
-    const totalJobs = batches.reduce((n, b) => n + b.totalJobs, 0);
-    const processedJobs = batches.reduce((n, b) => n + b.processedJobs, 0);
-    const failedJobs = batches.reduce((n, b) => n + b.failedJobs, 0);
-    const fitJobs = batches.reduce((n, b) => n + b.fitJobs, 0);
-    const notFitJobs = batches.reduce((n, b) => n + b.notFitJobs, 0);
-    const remainingJobs = batches.reduce((n, b) => n + b.remainingJobs, 0);
-    const activeBatches = batches.filter(
-      (b) => b.status === "queued" || b.status === "evaluating",
-    ).length;
-
-    return {
-      status: String(run?.evaluation_status ?? "none"),
-      totalJobs,
-      processedJobs,
-      failedJobs,
-      fitJobs,
-      notFitJobs,
-      remainingJobs,
-      activeBatches,
-      batches,
-    };
+    const userId = run?.user_id ?? null;
+    const batches = await collectEvaluationBatches(
+      userId,
+      (rows ?? []) as Record<string, unknown>[],
+    );
+    return summarizeBatches(batches, String(run?.evaluation_status ?? "none"));
   } catch (err) {
     console.warn(`[ws] getEvaluationState(${runId}) failed: ${err}`);
     return {
@@ -454,7 +518,12 @@ async function buildStats(
     getRunCounts(userId, targetRun),
     getRunBoardCounts(userId, targetRun),
     getRunBoardDetail(targetRun),
-    getEvaluationState(targetRun),
+    // ACCOUNT-WIDE evaluation state: every keyword batch across all the
+    // user's runs. Scoping to `targetRun` would hide completed batches that
+    // belong to an earlier run (the "still no fit / not fit" bug — the clerk
+    // batch lives under an older run than the latest). The fit/not-fit panel
+    // must show the full account picture.
+    getUserEvaluationState(userId),
   ]);
 
   return {
