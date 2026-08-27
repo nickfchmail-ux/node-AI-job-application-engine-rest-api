@@ -5,10 +5,16 @@
 //  dashboard via Supabase Realtime.
 //
 //  Stages: pending → fetching → extracting → done | blocked | failed
+//
+//  WRITE-BATCHING: all writes are BUFFERED through the Event Hub
+//  sink (eventHubSink.ts) and flushed to Supabase in batches by
+//  the consumer — NOT one Supabase call per stage bump.
 // ============================================================
 
 import { getSupabaseClient } from "./supabase";
 import { notifyStateChange } from "./redisState";
+import { bufferWrite } from "./eventHubSink";
+import type { BoardPatchEvent } from "./batchedSupabase";
 
 export type RunBoardStage =
   | "pending"
@@ -63,41 +69,31 @@ export async function ensureRunBoard(
   runId: string,
   board: string,
 ): Promise<void> {
-  const supabase = getSupabaseClient();
-  const { error } = await supabase.from("run_boards").upsert(
-    {
-      run_id: runId,
-      board_key: board,
-      stage: "pending",
-    },
-    { onConflict: "run_id,board_key", ignoreDuplicates: true },
-  );
-  if (error) {
-    console.warn(
-      `[runBoardState] ensureRunBoard(${board}) failed: ${error.message}`,
-    );
-  }
+  // Buffer the ensure as a pending stage patch — the consumer upserts it.
+  bufferWrite({
+    op: "board-patch",
+    runId,
+    board,
+    userId: userIdCache.get(runId) ?? null,
+    patch: { stage: "pending" },
+  } satisfies BoardPatchEvent);
 }
 
-/** Upsert a run_boards row with a partial patch. */
+/** Upsert a run_boards row with a partial patch (buffered → Event Hub). */
 export async function updateRunBoard(
   runId: string,
   board: string,
   patch: RunBoardPatch,
 ): Promise<void> {
-  const supabase = getSupabaseClient();
-  const { error } = await supabase
-    .from("run_boards")
-    .upsert(
-      { run_id: runId, board_key: board, ...patch },
-      { onConflict: "run_id,board_key" },
-    );
-  if (error) {
-    console.warn(
-      `[runBoardState] updateRunBoard(${board}) failed: ${error.message}`,
-    );
-    return;
-  }
+  // Buffer the patch; the Event Hub consumer coalesces + writes it.
+  bufferWrite({
+    op: "board-patch",
+    runId,
+    board,
+    userId: userIdCache.get(runId) ?? null,
+    patch: { ...patch },
+  } satisfies BoardPatchEvent);
+
   // Fire-and-forget: tell the Express server to push the latest
   // per-board state (stage + counters) to this run's user over the
   // WebSocket. This is what makes a board's stage change from
@@ -175,10 +171,10 @@ export async function markBoardFailed(
 }
 
 /**
- * Increment per-board progress counters (jobs_found etc.).
- * Uses the atomic Postgres RPC `increment_run_board` so CONCURRENT
- * job-processor invocations ACCUMULATE correctly (a plain upsert-SET
- * would overwrite, losing all but the last write under 16-way parallelism).
+ * Increment per-board progress counters (jobs_found etc.) — BUFFERED
+ * through the Event Hub sink, coalesced by the consumer into ONE additive
+ * RPC per (runId, board). The RPC `increment_run_board` accumulates
+ * correctly under concurrency (a plain upsert-SET would overwrite).
  */
 export async function bumpRunBoardCounts(
   runId: string,
@@ -190,20 +186,13 @@ export async function bumpRunBoardCounts(
     duplicate?: number;
   },
 ): Promise<void> {
-  const supabase = getSupabaseClient();
-  const { error } = await supabase.rpc("increment_run_board", {
-    p_run_id: runId,
-    p_board: board,
-    p_jobs_found: delta.jobs_found ?? 0,
-    p_jobs_processed: delta.jobs_processed ?? 0,
-    p_jobs_failed: delta.jobs_failed ?? 0,
-    p_duplicate: delta.duplicate ?? 0,
+  bufferWrite({
+    op: "board-count",
+    runId,
+    board,
+    userId: userIdCache.get(runId) ?? null,
+    delta,
   });
-  if (error) {
-    console.warn(
-      `[runBoardState] increment_run_board(${board}) failed: ${error.message}`,
-    );
-  }
 }
 
 /**

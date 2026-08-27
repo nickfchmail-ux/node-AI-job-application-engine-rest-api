@@ -37,7 +37,12 @@ import {
   markRunProcessing,
   markRunScraping,
 } from "../supabase";
-import type { JobMessage, ScrapedJob, ScrapeRequestMessage } from "../types";
+import type {
+  JobMessage,
+  RunSelfHealMessage,
+  ScrapedJob,
+  ScrapeRequestMessage,
+} from "../types";
 import { recordRetryUsage, refundUsageById } from "../usage";
 
 app.serviceBusQueue("scrape-requests", {
@@ -407,7 +412,56 @@ async function runScraper(
     const normalized = normalizeJobs(unique, { defaultLocation: "Hong Kong" });
     if (normalized.length === 0) return 0;
 
-    // Fan out with concurrency cap
+    // ── WRITE-BATCHING: per-board synchronous pre-insert ──────
+    // Build ALL of this board's normalized rows, then do ONE
+    // `jobs.upsert(rows[])` for the whole board (instead of N per-job
+    // upserts). This is done BEFORE enqueueing the Service Bus messages
+    // so the job processor + finalizeRunIfDone always see the committed
+    // pre-insert rows — no ordering race.
+    const preinsertRows = normalized.map((job) => ({
+      title: job.title,
+      company: job.company,
+      location: job.location ?? null,
+      salary: job.salaryDisplay ?? null,
+      posted_date: job.postedDate ?? null,
+      url: job.url,
+      short_description: job.description ?? null,
+      keyword: body.keyword,
+      search_key: body.keyword.toLowerCase().replace(/\s+/g, "_"),
+      scraped_date: scrapedDate,
+      last_seen_at: new Date().toISOString(),
+      status: "queued",
+      board: job.board,
+      pipeline_run_id: runId,
+      user_id: body.userId || null,
+    }));
+    try {
+      const { error } = await supabase
+        .from("jobs")
+        .upsert(preinsertRows, {
+          onConflict: "url,user_id",
+          // Keep first-seen semantics: on conflict, DON'T overwrite
+          // scraped_date (first-seen folder name) — just refresh
+          // last_seen_at + status so cross-day re-searches dedupe.
+          ignoreDuplicates: false,
+        })
+        .select("id");
+      if (error) {
+        console.warn(
+          `[scraper] board ${boardJobs[0].board} pre-insert batch (${preinsertRows.length}) failed: ${error.message}`,
+        );
+      } else {
+        console.info(
+          `[scraper] board ${boardJobs[0].board} — pre-inserted ${preinsertRows.length} row(s) in ONE upsert`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[scraper] board ${boardJobs[0].board} pre-insert batch threw: ${err}`,
+      );
+    }
+
+    // Fan out with concurrency cap (enqueue only — rows already in DB).
     const CONCURRENCY = 10;
     let cursor = 0;
     const fanOutOne = async (job: (typeof normalized)[number]) => {
@@ -436,38 +490,6 @@ async function runScraper(
         keyword: body.keyword,
         scrapedDate,
       };
-      await supabase
-        .from("jobs")
-        .upsert(
-          {
-            title: job.title,
-            company: job.company,
-            location: job.location ?? null,
-            salary: job.salaryDisplay ?? null,
-            posted_date: job.postedDate ?? null,
-            url: job.url,
-            short_description: job.description ?? null,
-            keyword: body.keyword,
-            search_key: body.keyword.toLowerCase().replace(/\s+/g, "_"),
-            scraped_date: scrapedDate,
-            last_seen_at: new Date().toISOString(),
-            status: "queued",
-            board: job.board,
-            pipeline_run_id: runId,
-            user_id: body.userId || null,
-          },
-          {
-            onConflict: "url,user_id",
-            // Keep first-seen semantics: on conflict, DON'T overwrite
-            // scraped_date (first-seen folder name) — just refresh
-            // last_seen_at + status so cross-day re-searches dedupe.
-            ignoreDuplicates: false,
-          },
-        )
-        .then(({ error }) => {
-          if (error)
-            console.warn(`[scraper] pre-insert job failed: ${error.message}`);
-        });
       await enqueue("jobs", msg, {
         messageId: `job-${jobId}`,
         ttlSeconds: 7200,
@@ -610,4 +632,33 @@ async function runScraper(
   }
 
   await markRunProcessing(runId);
+
+  // ── EVENT-DRIVEN self-heal (NOT a timer) ─────────────────────
+  // One-shot delayed check for THIS run: ~90s after the worker finishes, a
+  // `run-self-heal` message becomes visible on the `jobs` queue. When it
+  // fires, recover-stuck-runs re-enqueues any jobs that were enqueued but
+  // NEVER delivered (lost Service Bus message / worker crash). This is
+  // event-driven — ONE message per run, fires once, then gone. It never
+  // keeps the Function App warm or costs money when idle (unlike a recurring
+  // timer that runs every N minutes).
+  try {
+    const healMsg: RunSelfHealMessage = {
+      type: "run-self-heal",
+      runId,
+      userId: body.userId,
+    };
+    // Delayed delivery so the job processor has time to work the queue
+    // normally; the self-heal only steps in if jobs are STILL stuck.
+    const delayMs = Number(process.env.SELF_HEAL_DELAY_MS ?? 90_000);
+    await enqueue("jobs", healMsg, {
+      messageId: `run-self-heal-${runId}`,
+      ttlSeconds: 3600,
+      scheduledEnqueueTimeUtc: new Date(Date.now() + delayMs),
+    });
+    console.info(
+      `[scraper] run ${runId} — scheduled one-shot self-heal check (+${delayMs}ms)`,
+    );
+  } catch (err) {
+    console.warn(`[scraper] run ${runId} self-heal enqueue failed: ${err}`);
+  }
 }

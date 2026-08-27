@@ -21,6 +21,14 @@
       "maxMessageBatchSize": 1000,
       "minMessageBatchSize": 1,
       "maxBatchWaitTime": "00:00:10"
+    },
+    "eventHubs": {
+      "maxBatchSize": 1000,
+      "minBatchSize": 10,
+      "maxWaitTime": "00:00:05",
+      "prefetchCount": 300,
+      "targetUnprocessedEventThreshold": 300,
+      "batchCheckpointFrequency": 1
     }
   }
 }

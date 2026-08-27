@@ -14,6 +14,8 @@
 param location string = resourceGroup().location
 param functionAppName string = 'jobsautomation-fn'
 param serviceBusNamespaceName string = 'jobsautomation-sbns'
+param eventHubNamespaceName string = 'jobsautomation-ehns'
+param eventHubName string = 'jobs'
 // (environment param removed — unused)
 
 @secure()
@@ -97,6 +99,41 @@ resource resumeBuildsQueue 'Microsoft.ServiceBus/namespaces/queues@2022-10-01-pr
   }
 }
 
+// ── Event Hubs namespace (write-batching layer) ───────────────
+// One `jobs` event hub where the pipeline buffers per-job writes.
+// The Event Hub trigger consumer coalesces a batch into a few
+// Supabase writes (see src/functions/eventHubConsumer.ts).
+resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' = {
+  name: eventHubNamespaceName
+  location: location
+  sku: {
+    name: 'Standard'
+    tier: 'Standard'
+    capacity: 1
+  }
+  properties: {
+    minimumTlsVersion: '1.2'
+  }
+}
+
+resource eventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' = {
+  name: eventHubName
+  parent: eventHubNamespace
+  properties: {
+    partitionCount: 16
+    retentionDescription: {
+      retentionTimeInHours: 1
+      cleanupPolicy: 'Delete'
+    }
+    // captureDescription: not enabled — we consume immediately
+  }
+}
+
+resource ehConsumerGroup 'Microsoft.EventHub/namespaces/eventhubs/consumergroups@2024-01-01' = {
+  name: '$Default'
+  parent: eventHub
+}
+
 // ── Function App ───────────────────────────────────────────────
 resource serverFarm 'Microsoft.Web/serverfarms@2023-01-01' = {
   name: '${functionAppName}-plan'
@@ -141,11 +178,37 @@ resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
         { name: 'GENERATED_RESUME_BUCKET', value: 'generated-resumes' }
         { name: 'RESUME_BUCKET', value: 'resume' }
         { name: 'AZURE_FUNCTION_WEBHOOK_SECRET', value: azureFunctionWebhookSecret }
+        {
+          name: 'EventHub__fullyQualifiedNamespace'
+          // strip scheme (https://) — @azure/event-hubs wants bare hostname
+          value: replace(replace(eventHubNamespace.properties.serviceBusEndpoint, 'https://', ''), '/', '')
+        }
+        { name: 'EventHub__credential', value: 'managedidentity' }
       ]
     }
   }
 }
 
+// ── RBAC: Function App identity → Event Hubs ──────────────────
+resource ehSenderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(eventHubNamespace.id, functionAppName, 'eh-sender')
+  scope: eventHubNamespace
+  properties: {
+    roleDefinitionId: '/providers/Microsoft.Authorization/roleDefinitions/2b629674-e913-4c01-ae53-ef4638d8f975' // Azure Event Hubs Data Sender
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource ehReceiverRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(eventHubNamespace.id, functionAppName, 'eh-receiver')
+  scope: eventHubNamespace
+  properties: {
+    roleDefinitionId: '/providers/Microsoft.Authorization/roleDefinitions/a638d3c7-ab3a-418d-83e6-5f17a39d4fde' // Azure Event Hubs Data Receiver
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
 // ── RBAC: Function App identity → Service Bus ──────────────────
 resource sbSenderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(serviceBusNamespace.id, functionAppName, 'sender')
@@ -183,3 +246,6 @@ output functionAppName_out string = functionAppName
 output functionAppDefaultHostName string = functionApp.properties.defaultHostName
 output serviceBusNamespaceName_out string = serviceBusNamespaceName
 output serviceBusEndpoint string = serviceBusNamespace.properties.serviceBusEndpoint
+output eventHubNamespaceName_out string = eventHubNamespaceName
+output eventHubEndpoint string = eventHubNamespace.properties.serviceBusEndpoint
+output eventHubName_out string = eventHub.name

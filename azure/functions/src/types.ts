@@ -114,6 +114,25 @@ export interface JobMessage {
   scrapedDate: string; // YYYY-MM-DD
 }
 
+/**
+ * One-shot, event-driven self-heal check for a run.
+ *
+ * Enqueued by the scraper worker (with a ~90s scheduled delay) AFTER it
+ * finishes fanning out a run's jobs and marks the run `processing`. When it
+ * becomes visible, the recover-stuck-runs queue trigger checks whether the
+ * run is still non-terminal AND has orphaned (never-delivered) jobs — if so,
+ * it re-enqueues them. This replaces a recurring timer: the check fires ONCE
+ * per run (not every N minutes), so a Consumption Function App stays cold and
+ * costs nothing when idle.
+ */
+export interface RunSelfHealMessage {
+  type: "run-self-heal";
+  runId: string; // pipeline_runs.id
+  userId: string;
+  /** Self-heal round (0 = first). Bounded retries while a run is stuck. */
+  round?: number;
+}
+
 /** Message enqueued on `resume-builds` — build a tailored resume for a fit job. */
 export interface ResumeBuildMessage {
   type: "build-resume";

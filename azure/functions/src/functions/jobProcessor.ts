@@ -31,6 +31,7 @@ import {
   updateJobStatusByUrl,
 } from "../supabase";
 import type { JobMessage } from "../types";
+import { bufferWrite } from "../eventHubSink";
 
 /**
  * Classify an error as TRANSIENT (upstream / network / anti-bot — retryable
@@ -207,28 +208,21 @@ app.serviceBusQueue("jobs", {
         user_id: userId || null,
       };
 
-      const supabase = getSupabaseClient();
-
-      const { data: upserted, error } = await supabase
-        .from("jobs")
-        .upsert(
-          { ...row, last_seen_at: new Date().toISOString() },
-          {
-            onConflict: "url,user_id",
-            // Date-independent dedup: same URL + user = ONE row. On
-            // conflict, refresh last_seen_at but keep scraped_date
-            // (first-seen) intact.
-            ignoreDuplicates: false,
-          },
-        )
-        .select("id");
-
-      if (error) {
-        console.error(
-          `[processor] upsert failed for job ${jobId}: ${error.message}`,
-        );
-        throw error; // triggers Service Bus retry (maxDeliveryCount)
-      }
+      // ── WRITE-BATCHING ──
+      // Instead of a direct `jobs.upsert` per job, buffer the completed
+      // row. The Event Hub consumer coalesces a run's rows into ONE
+      // `jobs.upsert`. Idempotent: upsert on (url, user_id) — a retry
+      // re-writes the same row.
+      bufferWrite({
+        op: "job",
+        type: "upsert",
+        runId,
+        userId: userId || null,
+        board,
+        keyword,
+        url,
+        row: { ...row, last_seen_at: new Date().toISOString() },
+      });
 
       // ── 4. Update Redis counters (per-user, lightweight funnel) ──
       // Scrape-only: this job is done processing — decrement the live
@@ -239,11 +233,12 @@ app.serviceBusQueue("jobs", {
       await bumpRunBoardCounts(runId, board, { jobs_processed: 1 }).catch(
         () => {},
       );
-      // If all jobs for this run are now terminal, mark the run completed
-      await finalizeRunIfDone(runId, console.log).catch(() => {});
+      // Run finalization now happens in the Event Hub consumer AFTER the
+      // buffered upsert batch lands, so a run is never marked completed
+      // before all its rows are committed. (No per-job finalize here.)
 
       console.info(
-        `[processor] ✓ job ${jobId} done — scraped & stored ("${enriched.title}" @ ${enriched.company})`,
+        `[processor] ✓ job ${jobId} done — buffered & stored ("${enriched.title}" @ ${enriched.company})`,
       );
     } catch (err) {
       const transient = isTransientError(err);
@@ -275,8 +270,7 @@ app.serviceBusQueue("jobs", {
         last_error: String(err).slice(0, 500),
         processing_completed_at: new Date().toISOString(),
       }).catch(() => {});
-      // If all jobs for this run are now terminal, mark the run completed
-      await finalizeRunIfDone(runId, console.log).catch(() => {});
+      // Finalization is deferred to the Event Hub consumer (after flush).
     }
   },
 });

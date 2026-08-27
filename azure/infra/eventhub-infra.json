@@ -1,0 +1,114 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.46.1.21595",
+      "templateHash": "17094780418423210549"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "eventHubNamespaceName": {
+      "type": "string",
+      "defaultValue": "jobsautomation-ehns"
+    },
+    "eventHubName": {
+      "type": "string",
+      "defaultValue": "jobs"
+    },
+    "functionAppName": {
+      "type": "string",
+      "defaultValue": "jobsautomation-fn"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.EventHub/namespaces",
+      "apiVersion": "2024-01-01",
+      "name": "[parameters('eventHubNamespaceName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Standard",
+        "capacity": 1
+      },
+      "properties": {
+        "minimumTlsVersion": "1.2"
+      }
+    },
+    {
+      "type": "Microsoft.EventHub/namespaces/eventhubs",
+      "apiVersion": "2024-01-01",
+      "name": "[format('{0}/{1}', parameters('eventHubNamespaceName'), parameters('eventHubName'))]",
+      "properties": {
+        "partitionCount": 16,
+        "retentionDescription": {
+          "retentionTimeInHours": 1,
+          "cleanupPolicy": "Delete"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.EventHub/namespaces/eventhubs/consumergroups",
+      "apiVersion": "2024-01-01",
+      "name": "[format('{0}/{1}/{2}', parameters('eventHubNamespaceName'), parameters('eventHubName'), '$Default')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('eventHubNamespaceName'), parameters('eventHubName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]",
+      "name": "[guid(resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName')), parameters('functionAppName'), 'eh-sender')]",
+      "properties": {
+        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/2b629674-e913-4c01-ae53-ef4638d8f975",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]",
+      "name": "[guid(resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName')), parameters('functionAppName'), 'eh-receiver')]",
+      "properties": {
+        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/a638d3c7-ab3a-418d-83e6-5f17a39d4fde",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "eventHubNamespaceName_out": {
+      "type": "string",
+      "value": "[parameters('eventHubNamespaceName')]"
+    },
+    "eventHubEndpoint": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName')), '2024-01-01').serviceBusEndpoint]"
+    },
+    "eventHubName_out": {
+      "type": "string",
+      "value": "[parameters('eventHubName')]"
+    },
+    "functionAppPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId]"
+    }
+  }
+}

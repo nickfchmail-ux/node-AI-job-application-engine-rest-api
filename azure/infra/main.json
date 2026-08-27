@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "2354923065349696350"
+      "templateHash": "666268630861447427"
     }
   },
   "parameters": {
@@ -20,6 +20,14 @@
     "serviceBusNamespaceName": {
       "type": "string",
       "defaultValue": "jobsautomation-sbns"
+    },
+    "eventHubNamespaceName": {
+      "type": "string",
+      "defaultValue": "jobsautomation-ehns"
+    },
+    "eventHubName": {
+      "type": "string",
+      "defaultValue": "jobs"
     },
     "supabaseUrl": {
       "type": "securestring"
@@ -105,6 +113,60 @@
       ]
     },
     {
+      "type": "Microsoft.ServiceBus/namespaces/queues",
+      "apiVersion": "2022-10-01-preview",
+      "name": "[format('{0}/{1}', parameters('serviceBusNamespaceName'), 'resume-builds')]",
+      "properties": {
+        "maxSizeInMegabytes": 1024,
+        "defaultMessageTimeToLive": "P2D",
+        "maxDeliveryCount": 5,
+        "duplicateDetectionHistoryTimeWindow": "PT10M",
+        "deadLetteringOnMessageExpiration": true,
+        "enablePartitioning": true,
+        "lockDuration": "PT5M"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.EventHub/namespaces",
+      "apiVersion": "2024-01-01",
+      "name": "[parameters('eventHubNamespaceName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Standard",
+        "capacity": 1
+      },
+      "properties": {
+        "minimumTlsVersion": "1.2"
+      }
+    },
+    {
+      "type": "Microsoft.EventHub/namespaces/eventhubs",
+      "apiVersion": "2024-01-01",
+      "name": "[format('{0}/{1}', parameters('eventHubNamespaceName'), parameters('eventHubName'))]",
+      "properties": {
+        "partitionCount": 16,
+        "retentionDescription": {
+          "retentionTimeInHours": 1,
+          "cleanupPolicy": "Delete"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.EventHub/namespaces/eventhubs/consumergroups",
+      "apiVersion": "2024-01-01",
+      "name": "[format('{0}/{1}/{2}', parameters('eventHubNamespaceName'), parameters('eventHubName'), '$Default')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces/eventhubs', parameters('eventHubNamespaceName'), parameters('eventHubName'))]"
+      ]
+    },
+    {
       "type": "Microsoft.Web/serverfarms",
       "apiVersion": "2023-01-01",
       "name": "[format('{0}-plan', parameters('functionAppName'))]",
@@ -113,7 +175,10 @@
         "name": "Y1",
         "tier": "Dynamic"
       },
-      "kind": "functionapp"
+      "kind": "functionapp",
+      "properties": {
+        "reserved": true
+      }
     },
     {
       "type": "Microsoft.Web/sites",
@@ -127,7 +192,7 @@
       "properties": {
         "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', format('{0}-plan', parameters('functionAppName')))]",
         "siteConfig": {
-          "linuxFxVersion": "node|20",
+          "linuxFxVersion": "Node|22",
           "appSettings": [
             {
               "name": "FUNCTIONS_WORKER_RUNTIME",
@@ -138,12 +203,16 @@
               "value": "~4"
             },
             {
-              "name": "AzureWebJobsStorage",
-              "value": "[reference(resourceId('Microsoft.Storage/storageAccounts', format('{0}{1}', take(parameters('functionAppName'), 8), uniqueString(resourceGroup().id))), '2023-05-01').primaryEndpoints.blob]"
+              "name": "AzureWebJobsStorage__accountName",
+              "value": "[format('{0}{1}', take(parameters('functionAppName'), 8), uniqueString(resourceGroup().id))]"
+            },
+            {
+              "name": "AzureWebJobsStorage__credential",
+              "value": "managedidentity"
             },
             {
               "name": "ServiceBus__fullyQualifiedNamespace",
-              "value": "[reference(resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName')), '2022-10-01-preview').serviceBusEndpoint]"
+              "value": "[replace(replace(reference(resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName')), '2022-10-01-preview').serviceBusEndpoint, 'https://', ''), '/', '')]"
             },
             {
               "name": "ServiceBus__credential",
@@ -166,17 +235,38 @@
               "value": "[parameters('deepSeekApi')]"
             },
             {
+              "name": "DEEP_SEEK_MODEL",
+              "value": "deepseek-v4-flash"
+            },
+            {
               "name": "CLOUDFLARE_PROXY_URL",
               "value": "[parameters('cloudflareProxyUrl')]"
             },
             {
+              "name": "GENERATED_RESUME_BUCKET",
+              "value": "generated-resumes"
+            },
+            {
+              "name": "RESUME_BUCKET",
+              "value": "resume"
+            },
+            {
               "name": "AZURE_FUNCTION_WEBHOOK_SECRET",
               "value": "[parameters('azureFunctionWebhookSecret')]"
+            },
+            {
+              "name": "EventHub__fullyQualifiedNamespace",
+              "value": "[replace(replace(reference(resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName')), '2024-01-01').serviceBusEndpoint, 'https://', ''), '/', '')]"
+            },
+            {
+              "name": "EventHub__credential",
+              "value": "managedidentity"
             }
           ]
         }
       },
       "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]",
         "[resourceId('Microsoft.Web/serverfarms', format('{0}-plan', parameters('functionAppName')))]",
         "[resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName'))]",
         "[resourceId('Microsoft.Storage/storageAccounts', format('{0}{1}', take(parameters('functionAppName'), 8), uniqueString(resourceGroup().id)))]"
@@ -185,10 +275,40 @@
     {
       "type": "Microsoft.Authorization/roleAssignments",
       "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]",
+      "name": "[guid(resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName')), parameters('functionAppName'), 'eh-sender')]",
+      "properties": {
+        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/2b629674-e913-4c01-ae53-ef4638d8f975",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]",
+        "[resourceId('Microsoft.Web/sites', parameters('functionAppName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]",
+      "name": "[guid(resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName')), parameters('functionAppName'), 'eh-receiver')]",
+      "properties": {
+        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/a638d3c7-ab3a-418d-83e6-5f17a39d4fde",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName'))]",
+        "[resourceId('Microsoft.Web/sites', parameters('functionAppName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
       "scope": "[resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName'))]",
       "name": "[guid(resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName')), parameters('functionAppName'), 'sender')]",
       "properties": {
-        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/69a216fc-b8cb-48d4-8b66-d0d2f1f9f6c2",
+        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
         "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId]",
         "principalType": "ServicePrincipal"
       },
@@ -203,13 +323,28 @@
       "scope": "[resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName'))]",
       "name": "[guid(resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName')), parameters('functionAppName'), 'receiver')]",
       "properties": {
-        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/4f6d3b9b-027b-4f4c-9142-0e5a2a4e1c6e",
+        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0",
         "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId]",
         "principalType": "ServicePrincipal"
       },
       "dependsOn": [
         "[resourceId('Microsoft.Web/sites', parameters('functionAppName'))]",
         "[resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Storage/storageAccounts', format('{0}{1}', take(parameters('functionAppName'), 8), uniqueString(resourceGroup().id)))]",
+      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', format('{0}{1}', take(parameters('functionAppName'), 8), uniqueString(resourceGroup().id))), parameters('functionAppName'), 'storageblob')]",
+      "properties": {
+        "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/sites', parameters('functionAppName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', format('{0}{1}', take(parameters('functionAppName'), 8), uniqueString(resourceGroup().id)))]"
       ]
     }
   ],
@@ -229,6 +364,18 @@
     "serviceBusEndpoint": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusNamespaceName')), '2022-10-01-preview').serviceBusEndpoint]"
+    },
+    "eventHubNamespaceName_out": {
+      "type": "string",
+      "value": "[parameters('eventHubNamespaceName')]"
+    },
+    "eventHubEndpoint": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.EventHub/namespaces', parameters('eventHubNamespaceName')), '2024-01-01').serviceBusEndpoint]"
+    },
+    "eventHubName_out": {
+      "type": "string",
+      "value": "[parameters('eventHubName')]"
     }
   }
 }

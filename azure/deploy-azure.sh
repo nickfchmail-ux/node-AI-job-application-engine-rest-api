@@ -25,7 +25,7 @@ CLOUDFLARE_PROXY_URL="${CLOUDFLARE_PROXY_URL:-}"
 SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY:-}"
 
 # ── Deploy Bicep ─────────────────────────────────────────────
-echo "══ Deploying Bicep (Function App + Service Bus) ══"
+echo "══ Deploying Bicep (Function App + Service Bus + Event Hubs) ══"
 az deployment group create \
   --resource-group "$RG" \
   --template-file infra/main.bicep \
@@ -36,7 +36,6 @@ az deployment group create \
     deepSeekApi="$DEEP_SEEK_API" \
     azureFunctionWebhookSecret="$AZURE_FUNCTION_WEBHOOK_SECRET" \
     cloudflareProxyUrl="$CLOUDFLARE_PROXY_URL" \
-    environment=dev \
   -o json
 
 echo "══ Deployment complete. Fetching outputs ══"
