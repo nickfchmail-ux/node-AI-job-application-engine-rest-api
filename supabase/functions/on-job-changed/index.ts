@@ -39,9 +39,65 @@ interface WebhookPayload {
 
 const AZURE_FN_BASE = Deno.env.get("AZURE_FN_BASE_URL") ?? ""; // e.g. https://jobsautomation.azurewebsites.net
 const SHARED_SECRET = Deno.env.get("AZURE_FUNCTION_WEBHOOK_SECRET") ?? "";
+// The Express/socket backend — where /webhook/state + /webhook/invalidate
+// live. Falls back to the Azure base when not set (keeps existing deploys
+// working); set SOCKET_API_BASE to the Render backend URL in production.
+const SOCKET_API_BASE =
+  Deno.env.get("SOCKET_API_BASE") ?? Deno.env.get("AZURE_FN_BASE_URL") ?? "";
 
 const RETRY_DELAYS_MS = [1000, 4000, 10000]; // 1s, 4s, 10s
 const MAX_RETRIES = RETRY_DELAYS_MS.length;
+
+/** POST to the socket backend's webhook with the shared secret. */
+async function postWebhook(path: string, body: unknown): Promise<void> {
+  if (!SOCKET_API_BASE) return; // not configured — skip
+  try {
+    await fetch(`${SOCKET_API_BASE}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-webhook-secret": SHARED_SECRET,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (err) {
+    console.warn(`[on-job-changed] socket webhook ${path} failed: ${err}`);
+  }
+}
+
+/**
+ * Notify the socket layer that a job changed.
+ *
+ * 1. `/webhook/invalidate` — clear the Redis caches (eval-state, latest-run,
+ *    run-board-detail) so the NEXT push recomputes fresh data. Without this,
+ *    the socket would keep serving the cached (up to 20s stale) evaluation
+ *    state even though a job just changed.
+ * 2. `/webhook/state` — push the live `stats` (or `job:state`) event to the
+ *    user's socket room so the browser updates WITHOUT polling.
+ *
+ * Both are event-driven: they fire only when a job actually changes (via the
+ * DB webhook), never on a timer or per-push Supabase query.
+ */
+async function notifySocket(payload: WebhookPayload): Promise<void> {
+  const userId = payload.record.user_id ?? null;
+  const runId = payload.record.pipeline_run_id ?? null;
+  if (!userId) return;
+
+  // Invalidate the backend's cached reads for this user (+ this run).
+  await postWebhook("/webhook/invalidate", { userId, runId });
+
+  // Push the live update. For job-row changes use `job:state` so the exact
+  // job's status/score streams; also nudge the account-wide `stats` so the
+  // evaluation fit/not-fit counters refresh.
+  await postWebhook("/webhook/state", {
+    userId,
+    runId,
+    scope: "job",
+    jobId: payload.record.id,
+  });
+  await postWebhook("/webhook/state", { userId, runId });
+}
 
 async function callAzure(url: string, body: unknown): Promise<Response> {
   if (!AZURE_FN_BASE || !SHARED_SECRET) {
@@ -177,20 +233,24 @@ serve(async (req: Request) => {
     );
   }
 
-  // ── Fire the Azure calls (async) ──────────────────────────
+  // ── Fire the Azure + socket calls (async) ──────────────────
   // Scrape-only pipeline: jobs are scraped & stored without AI fit
   // analysis, so resume generation is DISABLED — only the general
   // job-processing notification is sent (which is a no-op for
   // completed jobs).
   //
   // We await so the Edge Function lifetime covers the requests.
-  const results: Promise<Response>[] = [notifyAzure(payload)];
+  const results: Promise<unknown>[] = [
+    notifyAzure(payload),
+    // Event-driven socket update: invalidate caches + push live state.
+    notifySocket(payload),
+  ];
 
   // Respond with the first non-OK status if any, else 200.
   const settled = await Promise.allSettled(results);
   for (const r of settled) {
-    if (r.status === "fulfilled" && r.value.status >= 400) {
-      return r.value;
+    if (r.status === "fulfilled" && (r.value as Response)?.status >= 400) {
+      return r.value as Response;
     }
   }
   return new Response(JSON.stringify({ ok: true }), {

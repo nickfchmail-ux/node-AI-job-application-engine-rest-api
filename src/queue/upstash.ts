@@ -135,3 +135,69 @@ export async function getRunMeta(
     return null;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Short-TTL cache for per-push Supabase reads.                      */
+/*                                                                     */
+/*  WHY: the socket `stats` push previously re-queried Supabase on     */
+/*  EVERY `/webhook/state` (latest run id, run_boards detail, and —    */
+/*  worst — a FULL select over the user's jobs for evaluation counts). */
+/*  On a busy run that's several Supabase round-trips per progress     */
+/*  update → the exhaustion the user hit. These helpers cache those    */
+/*  reads in Redis with a short TTL so Supabase is hit occasionally,   */
+/*  not on every push. The values are bounded in staleness (TTL) and   */
+/*  invalidated explicitly when the underlying data changes.           */
+/* ------------------------------------------------------------------ */
+
+const cacheKey = (name: string, id: string) => `cache:${name}:${id}`;
+
+/** GET a cached JSON value (string|object) — null when absent/expired. */
+async function cacheGet(name: string, id: string): Promise<string | null> {
+  return get(cacheKey(name, id));
+}
+
+/** SET a cached JSON value with a TTL (seconds). */
+async function cacheSet(
+  name: string,
+  id: string,
+  value: unknown,
+  ttlSeconds: number,
+): Promise<void> {
+  try {
+    const client = getClient();
+    const raw = typeof value === "string" ? value : JSON.stringify(value);
+    await client.request(["SETEX", cacheKey(name, id), String(ttlSeconds), raw]);
+  } catch (err) {
+    console.warn(`[upstash] cacheSet ${name}:${id} failed: ${err}`);
+  }
+}
+
+/** DELETE a cached value (call after the underlying data changes). */
+export async function cacheDelete(name: string, id: string): Promise<void> {
+  try {
+    const client = getClient();
+    await client.request(["DEL", cacheKey(name, id)]);
+  } catch (err) {
+    console.warn(`[upstash] cacheDelete ${name}:${id} failed: ${err}`);
+  }
+}
+
+/** JSON-safe get+set with TTL in one call. Returns parsed value or null. */
+export async function cacheGetOrSet<T>(
+  name: string,
+  id: string,
+  ttlSeconds: number,
+  compute: () => Promise<T | null>,
+): Promise<T | null> {
+  const hit = await cacheGet(name, id);
+  if (hit !== null) {
+    try {
+      return JSON.parse(hit) as T;
+    } catch {
+      /* fall through to recompute */
+    }
+  }
+  const value = await compute();
+  if (value !== null) await cacheSet(name, id, value, ttlSeconds);
+  return value;
+}

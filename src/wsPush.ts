@@ -33,6 +33,7 @@ import { Server as HttpServer } from "http";
 import { Socket, Server as SocketIOServer } from "socket.io";
 import { getSupabaseClient } from "./db";
 import {
+  cacheGetOrSet,
   getRunBoardCounts,
   getRunCounts,
   getUserSummary,
@@ -182,62 +183,78 @@ function mapStatusLabel(status: string | null): string | null {
  * Read run_boards rows + the run's requested board list from Supabase.
  * This is the authoritative source for EACH board's search stage
  * (pending → fetching → extracting → done | blocked | failed).
+ *
+ * CACHED in Redis (TTL 10s) keyed by runId so a run's board stages aren't
+ * re-read from Supabase on every push during a busy scrape. The stages
+ * change a handful of times per run; a 10s lag is fine and the per-board
+ * live counters still come from Redis (real-time).
  */
 async function getRunBoardDetail(runId: string): Promise<{
   rows: Record<string, unknown>[];
   requested: string[];
   status: string | null;
 }> {
-  try {
-    const supabase = getSupabaseClient();
-    const [{ data: rows, error: rowErr }, { data: run, error: runErr }] =
-      await Promise.all([
-        supabase.from("run_boards").select("*").eq("run_id", runId),
-        supabase
-          .from("pipeline_runs")
-          .select("boards, status")
-          .eq("id", runId)
-          .maybeSingle(),
-      ]);
-    if (rowErr)
-      console.warn(`[ws] run_boards(${runId}) failed: ${rowErr.message}`);
-    if (runErr)
-      console.warn(`[ws] pipeline_runs(${runId}) failed: ${runErr.message}`);
-    return {
-      rows: (rows ?? []) as Record<string, unknown>[],
-      requested: ((run?.boards as string[]) ?? []) as string[],
-      status: (run?.status as string | undefined) ?? null,
-    };
-  } catch (err) {
-    console.warn(`[ws] getRunBoardDetail(${runId}) failed: ${err}`);
-    return { rows: [], requested: [], status: null };
-  }
+  return (
+    (await cacheGetOrSet("run-board-detail", runId, 10, async () => {
+      try {
+        const supabase = getSupabaseClient();
+        const [{ data: rows, error: rowErr }, { data: run, error: runErr }] =
+          await Promise.all([
+            supabase.from("run_boards").select("*").eq("run_id", runId),
+            supabase
+              .from("pipeline_runs")
+              .select("boards, status")
+              .eq("id", runId)
+              .maybeSingle(),
+          ]);
+        if (rowErr)
+          console.warn(`[ws] run_boards(${runId}) failed: ${rowErr.message}`);
+        if (runErr)
+          console.warn(`[ws] pipeline_runs(${runId}) failed: ${runErr.message}`);
+        return {
+          rows: (rows ?? []) as Record<string, unknown>[],
+          requested: ((run?.boards as string[]) ?? []) as string[],
+          status: (run?.status as string | undefined) ?? null,
+        };
+      } catch (err) {
+        console.warn(`[ws] getRunBoardDetail(${runId}) failed: ${err}`);
+        return { rows: [], requested: [], status: null };
+      }
+    })) ?? { rows: [], requested: [], status: null }
+  );
 }
 
 /**
  * The user's MOST RECENT run id (from Supabase pipeline_runs, ordered by
  * created_at desc). This is authoritative + ordered — the Redis SMEMBERS
  * set is unordered, so we don't rely on it for the "current run".
+ *
+ * CACHED in Redis (TTL 15s) so this isn't a Supabase query on every socket
+ * push. A new run appearing is rare; a 15s staleness on "which run to show"
+ * is imperceptible, and the frontend's own runId (from the scrape trigger)
+ * is used for the active run anyway.
  */
 async function getLatestRunId(userId: string): Promise<string | null> {
-  try {
-    const supabase = getSupabaseClient();
-    const { data, error } = await supabase
-      .from("pipeline_runs")
-      .select("id")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) {
-      console.warn(`[ws] latest run(${userId}) failed: ${error.message}`);
+  return cacheGetOrSet("latest-run", userId, 15, async () => {
+    try {
+      const supabase = getSupabaseClient();
+      const { data, error } = await supabase
+        .from("pipeline_runs")
+        .select("id")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) {
+        console.warn(`[ws] latest run(${userId}) failed: ${error.message}`);
+        return null;
+      }
+      return data?.id ? String(data.id) : null;
+    } catch (err) {
+      console.warn(`[ws] latest run(${userId}) failed: ${err}`);
       return null;
     }
-    return data?.id ? String(data.id) : null;
-  } catch (err) {
-    console.warn(`[ws] latest run(${userId}) failed: ${err}`);
-    return null;
-  }
+  });
 }
 
 /**
@@ -385,60 +402,82 @@ function summarizeBatches(
  * search-key evaluation spans multiple runs, so scoping to one run would
  * silently hide completed batches (the symptom behind "still no fit / not
  * fit"). Used on connect and on every stats push.
+ *
+ * CACHED in Redis (TTL 20s) — this was the #1 Supabase exhaustor: it ran a
+ * FULL `select` over the user's `completed`/`analysed` jobs on EVERY stats
+ * push. During an active evaluation the fit/not-fit counts update as jobs
+ * are scored, so a 20s cache means the expensive query runs ~3×/min per user
+ * instead of on every push (which can fire every second). The cache is
+ * invalidated explicitly when a job changes (edge function → webhook) and by
+ * TTL otherwise.
  */
 async function getUserEvaluationState(
   userId: string,
 ): Promise<EvaluationState> {
-  try {
-    const supabase = getSupabaseClient();
-    const { data: rows, error: rowsErr } = await supabase
-      .from("evaluation_runs")
-      .select("*")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: true });
-    if (rowsErr)
-      console.warn(
-        `[ws] evaluation_runs(user ${userId}) failed: ${rowsErr.message}`,
-      );
-    const batches = await collectEvaluationBatches(
-      userId,
-      (rows ?? []) as Record<string, unknown>[],
-    );
-    // A batch only counts as ACTIVE if it is queued/evaluating AND was updated
-    // recently. A batch stuck in "evaluating" for a long time (e.g. the worker
-    // died mid-run, or a stale row from a previous session) must NOT keep the
-    // whole account-wide status at "evaluating" — that made the match panel
-    // show "Starting your match…" forever after a page refresh even though the
-    // user's actual match had finished.
-    const now = Date.now();
-    const STALE_MS = 10 * 60 * 1000; // 10 minutes
-    const isActive = (b: EvaluationBatchState): boolean => {
-      if (b.status !== "queued" && b.status !== "evaluating") return false;
-      const updatedAt = (b as { updatedAt?: string }).updatedAt;
-      if (updatedAt) {
-        const t = new Date(updatedAt).getTime();
-        if (!Number.isNaN(t) && now - t > STALE_MS) return false;
+  return (
+    (await cacheGetOrSet("eval-state", userId, 20, async () => {
+      try {
+        const supabase = getSupabaseClient();
+        const { data: rows, error: rowsErr } = await supabase
+          .from("evaluation_runs")
+          .select("*")
+          .eq("user_id", userId)
+          .order("created_at", { ascending: true });
+        if (rowsErr)
+          console.warn(
+            `[ws] evaluation_runs(user ${userId}) failed: ${rowsErr.message}`,
+          );
+        const batches = await collectEvaluationBatches(
+          userId,
+          (rows ?? []) as Record<string, unknown>[],
+        );
+        // A batch only counts as ACTIVE if it is queued/evaluating AND was updated
+        // recently. A batch stuck in "evaluating" for a long time (e.g. the worker
+        // died mid-run, or a stale row from a previous session) must NOT keep the
+        // whole account-wide status at "evaluating" — that made the match panel
+        // show "Starting your match…" forever after a page refresh even though the
+        // user's actual match had finished.
+        const now = Date.now();
+        const STALE_MS = 10 * 60 * 1000; // 10 minutes
+        const isActive = (b: EvaluationBatchState): boolean => {
+          if (b.status !== "queued" && b.status !== "evaluating") return false;
+          const updatedAt = (b as { updatedAt?: string }).updatedAt;
+          if (updatedAt) {
+            const t = new Date(updatedAt).getTime();
+            if (!Number.isNaN(t) && now - t > STALE_MS) return false;
+          }
+          return true;
+        };
+        const anyActive = batches.some(isActive);
+        const anyProcessed = batches.some(
+          (b) => b.status === "completed" && b.processedJobs > 0,
+        );
+        const status = anyActive
+          ? "evaluating"
+          : batches.length === 0
+            ? "none"
+            : anyProcessed
+              ? "completed"
+              : "failed";
+        const state = summarizeBatches(batches, status);
+        // activeBatches should reflect only genuinely-active batches, not stale ones.
+        state.activeBatches = batches.filter(isActive).length;
+        return state;
+      } catch (err) {
+        console.warn(`[ws] getUserEvaluationState(${userId}) failed: ${err}`);
+        return {
+          status: "none",
+          totalJobs: 0,
+          processedJobs: 0,
+          failedJobs: 0,
+          fitJobs: 0,
+          notFitJobs: 0,
+          remainingJobs: 0,
+          activeBatches: 0,
+          batches: [],
+        };
       }
-      return true;
-    };
-    const anyActive = batches.some(isActive);
-    const anyProcessed = batches.some(
-      (b) => b.status === "completed" && b.processedJobs > 0,
-    );
-    const status = anyActive
-      ? "evaluating"
-      : batches.length === 0
-        ? "none"
-        : anyProcessed
-          ? "completed"
-          : "failed";
-    const state = summarizeBatches(batches, status);
-    // activeBatches should reflect only genuinely-active batches, not stale ones.
-    state.activeBatches = batches.filter(isActive).length;
-    return state;
-  } catch (err) {
-    console.warn(`[ws] getUserEvaluationState(${userId}) failed: ${err}`);
-    return {
+    })) ?? {
       status: "none",
       totalJobs: 0,
       processedJobs: 0,
@@ -448,8 +487,8 @@ async function getUserEvaluationState(
       remainingJobs: 0,
       activeBatches: 0,
       batches: [],
-    };
-  }
+    }
+  );
 }
 
 /**
