@@ -15,11 +15,7 @@ import { app, InvocationContext } from "@azure/functions";
 import { extractListings } from "../boardParsers";
 import { getBoardPattern } from "../boardRegistry";
 import { fetchBoardPage } from "../cloudflareProxy";
-import {
-  applyNormalized,
-  canonicalizeUrl,
-  normalizeJobs,
-} from "../normalize";
+import { applyNormalized, canonicalizeUrl, normalizeJobs } from "../normalize";
 import {
   fetchIndeedBatchDescriptionsApi,
   scrapeLinkedInApi,
@@ -36,11 +32,13 @@ import {
 import { enqueue } from "../serviceBus";
 import {
   getSupabaseClient,
+  markRunCompleted,
   markRunFailed,
   markRunProcessing,
   markRunScraping,
 } from "../supabase";
 import type { JobMessage, ScrapedJob, ScrapeRequestMessage } from "../types";
+import { recordRetryUsage, refundUsageById } from "../usage";
 
 app.serviceBusQueue("scrape-requests", {
   queueName: "scrape-requests",
@@ -131,12 +129,6 @@ async function runScraper(
             console.info(
               `[scraper] ${board} p${page}: ${apiJobs.length} jobs (via public API)`,
             );
-            await incrementCounters(
-              body.userId,
-              runId,
-              { scraped: apiJobs.length },
-              board,
-            );
             return { page, ok: true as const, jobs: apiJobs.length };
           }
           console.warn(
@@ -154,12 +146,6 @@ async function runScraper(
             for (const j of apiJobs) allJobs.push({ ...j, board });
             console.info(
               `[scraper] ${board} p${page}: ${apiJobs.length} jobs (via guest API)`,
-            );
-            await incrementCounters(
-              body.userId,
-              runId,
-              { scraped: apiJobs.length },
-              board,
             );
             return { page, ok: true as const, jobs: apiJobs.length };
           }
@@ -199,12 +185,6 @@ async function runScraper(
             allJobs.push({ ...j, board });
           }
           console.info(`[scraper] ${board} p${page}: ${jobs.length} jobs`);
-          await incrementCounters(
-            body.userId,
-            runId,
-            { scraped: jobs.length },
-            board,
-          );
           return { page, ok: true as const, jobs: jobs.length };
         } catch (err) {
           console.warn(`[scraper] parse error ${board} p${page}: ${err}`);
@@ -351,6 +331,37 @@ async function runScraper(
       }).catch(() => {});
     }
     if (unique.length === 0) return 0;
+
+    // ── Per-board result cap (after dedup) ──────────────────
+    // Free=5, Standard=10, Pro=∞ (undefined). Because dedup already removed
+    // every URL this user has seen, a REPEATED search with the same keyword
+    // returns the NEXT `maxResultsPerBoard` new URLs per board — i.e. each
+    // repeat search advances the user through the board's results.
+    if (
+      typeof body.maxResultsPerBoard === "number" &&
+      body.maxResultsPerBoard > 0
+    ) {
+      const cap = body.maxResultsPerBoard;
+      if (unique.length > cap) {
+        const dropped = unique.length - cap;
+        unique.splice(cap); // keep the first `cap`, drop the rest
+        console.info(
+          `[scraper] ${boardJobs[0].board} — capped results to ${cap} (dropped ${dropped} beyond plan limit)`,
+        );
+      }
+    }
+
+    // Report the CAPPED count to the socket — this is what's actually saved,
+    // so the UI headline never claims more than the plan allows. `scraped` =
+    // total kept, `unique` = new jobs enqueued (both equal after the cap).
+    if (unique.length > 0) {
+      await incrementCounters(
+        body.userId,
+        runId,
+        { scraped: unique.length, unique: unique.length },
+        boardJobs[0].board,
+      );
+    }
 
     // Register these as seen so a later board doesn't re-fan them
     for (const j of unique) {
@@ -523,6 +534,22 @@ async function runScraper(
           : `All boards failed: ${boardErrors.join("; ")}`
         : "No jobs found for this keyword.";
     console.warn(`[scraper] run ${runId} — no jobs: ${reason}`);
+
+    // ── REFUND the search credit ─────────────────────────────
+    // A NON-retry run had its search quota consumed UPFRONT at the HTTP
+    // trigger. If it delivered 0 jobs (every board failed / nothing found),
+    // the user got nothing for their credit — refund it so they don't lose
+    // their only search to a transient outage. Retries never had an upfront
+    // deduction (they only record on success), so nothing to refund there.
+    if (!body.retry && body.usageId) {
+      await refundUsageById(body.usageId, body.userId, "search").catch(
+        () => {},
+      );
+      console.info(
+        `[scraper] run ${runId} — refunded search credit (${body.usageId}) — 0 jobs delivered`,
+      );
+    }
+
     await markRunFailed(runId, reason);
     return;
   }
@@ -530,5 +557,57 @@ async function runScraper(
   console.info(
     `[scraper] run ${runId} — enqueued ${totalEnqueued} job(s) to process`,
   );
+
+  // ── REFUND if nothing new was delivered ─────────────────────
+  // Covers BOTH the "0 jobs found/failed" case (allJobs.length===0, handled
+  // above) AND the "found but all duplicates" case (allJobs.length>0 but
+  // totalEnqueued===0 — every listing already in the user's list). Either
+  // way the user got 0 NEW jobs for their credit, so refund it. This prevents
+  // a limited user's only search being burned on a re-search that surfaces
+  // nothing new. Retries never had an upfront deduction — nothing to refund.
+  if (!body.retry && body.usageId && totalEnqueued === 0) {
+    await refundUsageById(body.usageId, body.userId, "search").catch(() => {});
+    console.info(
+      `[scraper] run ${runId} — refunded search credit (${body.usageId}) — 0 new jobs delivered`,
+    );
+  }
+
+  // ── Terminal state when NOTHING was enqueued ────────────────
+  // If 0 jobs were enqueued (every listing was a duplicate), there is nothing
+  // for the job processor to work on — so the run would otherwise stay stuck
+  // in "processing" forever and the UI would hang on "Finding jobs…". Mark it
+  // COMPLETED so the frontend transitions to the "0 new jobs saved" state.
+  if (totalEnqueued === 0) {
+    console.info(
+      `[scraper] run ${runId} — 0 new jobs enqueued (all duplicates or empty); marking completed`,
+    );
+    await markRunCompleted(runId, {
+      total: 0,
+      processed: 0,
+      failed: 0,
+      fit: 0,
+    }).catch((err) => {
+      console.warn(`[scraper] markRunCompleted failed: ${err}`);
+    });
+    return;
+  }
+
+  // ── Quota on SUCCESSFUL retry ─────────────────────────────
+  // The scrape HTTP trigger SKIPS the search-quota deduction for retries (so
+  // a failed retry never burns a limited user's search). But the user wants
+  // the retry to count quota IF it actually succeeds. A retry "succeeds" when
+  // at least one NEW job was enqueued (totalEnqueued > 0). Record the usage
+  // row here — best-effort; the scrape trigger already validated the user.
+  if (body.retry && totalEnqueued > 0) {
+    try {
+      await recordRetryUsage(body.userId, "search", body.keyword);
+      console.info(
+        `[scraper] run ${runId} — retry succeeded (${totalEnqueued} jobs), search quota counted`,
+      );
+    } catch (err) {
+      console.warn(`[scraper] retry usage record failed: ${err}`);
+    }
+  }
+
   await markRunProcessing(runId);
 }

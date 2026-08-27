@@ -49,12 +49,14 @@ router.post("/scrape", requireAuth, async (req: Request, res: Response) => {
     force = false,
     boards,
     country_code,
+    max_results_per_board,
   } = req.body as {
     keyword?: string;
     pages?: number;
     force?: boolean;
     boards?: string[];
     country_code?: string;
+    max_results_per_board?: number;
   };
 
   if (!keyword || typeof keyword !== "string" || !keyword.trim()) {
@@ -64,7 +66,11 @@ router.post("/scrape", requireAuth, async (req: Request, res: Response) => {
 
   try {
     // ── Prevent duplicate scrape submissions for same user+keyword ─────────
-    const existingJobs = await pipelineQueue.getJobs(["active", "waiting", "delayed"]);
+    const existingJobs = await pipelineQueue.getJobs([
+      "active",
+      "waiting",
+      "delayed",
+    ]);
     const duplicate = existingJobs.find(
       (j) =>
         j.data.type === "scrape" &&
@@ -90,16 +96,28 @@ router.post("/scrape", requireAuth, async (req: Request, res: Response) => {
         boards: Array.isArray(boards) ? boards : undefined,
         userId: req.userId!,
         countryCode:
-          typeof country_code === "string" ? country_code.slice(0, 5) : undefined,
+          typeof country_code === "string"
+            ? country_code.slice(0, 5)
+            : undefined,
+        maxResultsPerBoard:
+          max_results_per_board !== undefined &&
+          Number.isFinite(Number(max_results_per_board))
+            ? Number(max_results_per_board)
+            : undefined,
       }),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Redis connection timed out")), 15_000),
+        setTimeout(
+          () => reject(new Error("Redis connection timed out")),
+          15_000,
+        ),
       ),
     ]);
 
     res.status(202).json({ jobId: job.id, pollUrl: `/jobs/${job.id}` });
   } catch (err) {
-    res.status(503).json({ error: (err as Error).message || "Service unavailable" });
+    res
+      .status(503)
+      .json({ error: (err as Error).message || "Service unavailable" });
   }
 });
 
@@ -125,17 +143,118 @@ router.get("/jobs/:jobId", requireAuth, async (req: Request, res: Response) => {
       return;
     }
 
-  // Ownership check
-  if (job.data.userId !== req.userId) {
-    res.status(403).json({ error: "Forbidden" });
-    return;
-  }
+    // Ownership check
+    if (job.data.userId !== req.userId) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
 
-  const state = await job.getState();
-  const { logs } = await pipelineQueue.getJobLogs(job.id!, 0, -1);
+    const state = await job.getState();
+    const { logs } = await pipelineQueue.getJobLogs(job.id!, 0, -1);
 
-  // ── Scrape (parent) job — aggregate child statuses ──────────────────────
-  if (job.data.type === "scrape") {
+    // ── Scrape (parent) job — aggregate child statuses ──────────────────────
+    if (job.data.type === "scrape") {
+      if (state === "failed") {
+        const body = { status: "error", error: job.failedReason, logs };
+        cacheResult(jobId, 500, body);
+        res.status(500).json(body);
+        return;
+      }
+
+      // Parent still running (scraping phase)
+      if (state !== "completed") {
+        res.json({ status: "scraping", logs });
+        return;
+      }
+
+      // Parent completed — children are being processed by workers
+      const result = job.returnvalue as ScrapeResult | null;
+      if (!result?.childJobIds?.length) {
+        const body = {
+          status: "done",
+          result: {
+            total: 0,
+            fit: 0,
+            jobs: [],
+            keyword: result?.keyword,
+            scrapedDate: result?.scrapedDate,
+          },
+          logs,
+        };
+        cacheResult(jobId, 200, body);
+        res.json(body);
+        return;
+      }
+
+      // Load child job states
+      const childJobs = await Promise.all(
+        result.childJobIds.map((id) =>
+          Job.fromId<PipelineJobData>(pipelineQueue, id),
+        ),
+      );
+
+      let completed = 0;
+      let failed = 0;
+      const results: unknown[] = [];
+      const childErrors: string[] = [];
+
+      for (const child of childJobs) {
+        if (!child) continue;
+        const childState = await child.getState();
+        if (childState === "completed") {
+          completed++;
+          results.push(child.returnvalue);
+        } else if (childState === "failed") {
+          failed++;
+          childErrors.push(`${child.failedReason}`);
+        }
+      }
+
+      const total = result.childJobIds.length;
+      const allDone = completed + failed >= total;
+
+      if (allDone) {
+        const fitCount = results.filter(
+          (r) =>
+            r && typeof r === "object" && (r as Record<string, unknown>).fit,
+        ).length;
+        const body = {
+          status: "done",
+          result: {
+            total,
+            completed,
+            failed,
+            fit: fitCount,
+            keyword: result.keyword,
+            scrapedDate: result.scrapedDate,
+            jobs: results,
+          },
+          logs: [...logs, ...childErrors],
+        };
+        cacheResult(jobId, 200, body);
+        res.json(body);
+      } else {
+        res.json({
+          status: "running",
+          progress: {
+            total,
+            completed,
+            failed,
+            pending: total - completed - failed,
+          },
+          logs,
+        });
+      }
+      return;
+    }
+
+    // ── Individual process-job (child) — direct status ──────────────────────
+    if (state === "completed") {
+      const body = { status: "done", result: job.returnvalue, logs };
+      cacheResult(jobId, 200, body);
+      res.json(body);
+      return;
+    }
     if (state === "failed") {
       const body = { status: "error", error: job.failedReason, logs };
       cacheResult(jobId, 500, body);
@@ -143,112 +262,12 @@ router.get("/jobs/:jobId", requireAuth, async (req: Request, res: Response) => {
       return;
     }
 
-    // Parent still running (scraping phase)
-    if (state !== "completed") {
-      res.json({ status: "scraping", logs });
-      return;
-    }
-
-    // Parent completed — children are being processed by workers
-    const result = job.returnvalue as ScrapeResult | null;
-    if (!result?.childJobIds?.length) {
-      const body = {
-        status: "done",
-        result: {
-          total: 0,
-          fit: 0,
-          jobs: [],
-          keyword: result?.keyword,
-          scrapedDate: result?.scrapedDate,
-        },
-        logs,
-      };
-      cacheResult(jobId, 200, body);
-      res.json(body);
-      return;
-    }
-
-    // Load child job states
-    const childJobs = await Promise.all(
-      result.childJobIds.map((id) =>
-        Job.fromId<PipelineJobData>(pipelineQueue, id),
-      ),
-    );
-
-    let completed = 0;
-    let failed = 0;
-    const results: unknown[] = [];
-    const childErrors: string[] = [];
-
-    for (const child of childJobs) {
-      if (!child) continue;
-      const childState = await child.getState();
-      if (childState === "completed") {
-        completed++;
-        results.push(child.returnvalue);
-      } else if (childState === "failed") {
-        failed++;
-        childErrors.push(`${child.failedReason}`);
-      }
-    }
-
-    const total = result.childJobIds.length;
-    const allDone = completed + failed >= total;
-
-    if (allDone) {
-      const fitCount = results.filter(
-        (r) => r && typeof r === "object" && (r as Record<string, unknown>).fit,
-      ).length;
-      const body = {
-        status: "done",
-        result: {
-          total,
-          completed,
-          failed,
-          fit: fitCount,
-          keyword: result.keyword,
-          scrapedDate: result.scrapedDate,
-          jobs: results,
-        },
-        logs: [...logs, ...childErrors],
-      };
-      cacheResult(jobId, 200, body);
-      res.json(body);
-    } else {
-      res.json({
-        status: "running",
-        progress: {
-          total,
-          completed,
-          failed,
-          pending: total - completed - failed,
-        },
-        logs,
-      });
-    }
-    return;
-  }
-
-  // ── Individual process-job (child) — direct status ──────────────────────
-  if (state === "completed") {
-    const body = { status: "done", result: job.returnvalue, logs };
-    cacheResult(jobId, 200, body);
-    res.json(body);
-    return;
-  }
-  if (state === "failed") {
-    const body = { status: "error", error: job.failedReason, logs };
-    cacheResult(jobId, 500, body);
-    res.status(500).json(body);
-    return;
-  }
-
-  const statusMap: Record<string, string> = {
-    active: "running",
-    waiting: "pending",
-    delayed: "pending",
-  };
-  res.json({ status: statusMap[state] ?? state, logs });
+    const statusMap: Record<string, string> = {
+      active: "running",
+      waiting: "pending",
+      delayed: "pending",
+    };
+    res.json({ status: statusMap[state] ?? state, logs });
   } catch (err) {
     console.error("[jobs] Error fetching job:", err);
     res.status(500).json({ error: "Internal server error — please try again" });

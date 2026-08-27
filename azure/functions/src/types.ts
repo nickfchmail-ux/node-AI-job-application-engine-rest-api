@@ -92,6 +92,14 @@ export interface ScrapeRequestMessage {
   pages: number;
   boards: string[];
   countryCode?: string;
+  /** Max results to keep per job board (Free=5, Standard=10, Pro=∞/undefined). */
+  maxResultsPerBoard?: number;
+  /** True when this is a RETRY of a failed/stuck run — no search quota consumed. */
+  retry?: boolean;
+  /** The usage_records row id consumed at the trigger — refunded if the run
+   *  produces 0 jobs (all boards failed). Lets the worker refund precisely,
+   *  regardless of how long the run took. */
+  usageId?: string | null;
 }
 
 /** Message enqueued on `jobs` by the scraper worker, one per listing. */

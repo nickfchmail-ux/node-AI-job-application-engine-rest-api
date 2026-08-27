@@ -23,6 +23,26 @@ import { fetchOfferTodayBatchDescriptions } from "./scrapers/offertoday";
 loadEnvLocal();
 
 // ----------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------
+/** Best-effort job board name derived from a job URL (used for per-board caps). */
+function boardFromUrl(url: string): string {
+  const host = (() => {
+    try {
+      return new URL(url).hostname.replace(/^www\./, "");
+    } catch {
+      return url;
+    }
+  })();
+  if (host.includes("indeed.com")) return "indeed";
+  if (host.includes("linkedin.com")) return "linkedin";
+  if (host.includes("jobsdb.com")) return "jobsdb";
+  if (host.includes("ctgoodjobs")) return "ctgoodjobs";
+  if (host.includes("offertoday")) return "offertoday";
+  return host;
+}
+
+// ----------------------------------------------------------------------
 // Health check server (required for Cloud Run)
 // ----------------------------------------------------------------------
 const app = express();
@@ -72,7 +92,15 @@ const STALLED_INTERVAL_MS = 5 * 60 * 1000;
 async function processScrapeJob(
   job: Job<ScrapeJobData>,
 ): Promise<ScrapeResult> {
-  const { keyword, pages, force, boards, userId, countryCode } = job.data;
+  const {
+    keyword,
+    pages,
+    force,
+    boards,
+    userId,
+    countryCode,
+    maxResultsPerBoard,
+  } = job.data;
   const log = (msg: string) => {
     console.log(`[job ${job.id}]`, msg);
     job.log(msg).catch(() => {});
@@ -177,6 +205,27 @@ async function processScrapeJob(
       log(
         `⏭  ${titleCompanySkipped.length} job(s) already in Supabase (same title+company) — skipping.`,
       );
+  }
+
+  // Apply per-board result cap (after dedup) — Free=5, Standard=10, Pro=∞.
+  // This means a repeated search with the same keyword returns the NEXT
+  // maxResultsPerBoard *new* URLs per board (dedup already removed seen ones).
+  if (typeof maxResultsPerBoard === "number" && maxResultsPerBoard > 0) {
+    const perBoardCount = new Map<string, number>();
+    const cappedJobs: ScrapedJob[] = [];
+    for (const j of newJobs) {
+      const board = boardFromUrl(j.url);
+      const used = perBoardCount.get(board) ?? 0;
+      if (used >= maxResultsPerBoard) continue;
+      perBoardCount.set(board, used + 1);
+      cappedJobs.push(j);
+    }
+    const dropped = newJobs.length - cappedJobs.length;
+    if (dropped > 0)
+      log(
+        `✂  Capped results to ${maxResultsPerBoard}/board — dropped ${dropped} job(s) beyond plan limit.`,
+      );
+    newJobs = cappedJobs;
   }
 
   if (newJobs.length === 0) {

@@ -343,9 +343,7 @@ async function collectEvaluationBatches(
 
     return {
       id: String(row.id),
-      pipelineRunId: row.pipeline_run_id
-        ? String(row.pipeline_run_id)
-        : null,
+      pipelineRunId: row.pipeline_run_id ? String(row.pipeline_run_id) : null,
       keyword: String(row.keyword ?? "general"),
       status: String(row.status ?? "queued"),
       totalJobs: Number(row.total_jobs ?? 0),

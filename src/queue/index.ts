@@ -15,6 +15,8 @@ export interface ScrapeJobData {
   userId: string;
   countryCode?: string;
   generateCoverLetter?: boolean;
+  /** Max results to keep per job board (Free=5, Standard=10, Pro=∞). */
+  maxResultsPerBoard?: number;
 }
 
 /** Phase 2 – enrich + analyse + persist ONE listing */

@@ -64,6 +64,37 @@ export async function fetchBoardPage(opts: {
   const pattern = getBoardPattern(board);
   const dcBlocked = pattern?.antiBot.datacenterBlocked === true;
   if (dcBlocked) {
+    // ── Indeed: go STRAIGHT to ScraperAPI (render=false). ──
+    // DataImpulse residential consistently times out from Azure (egress
+    // issue) AND gets a 403 Security Check from Indeed. ScraperAPI with
+    // render=false returns the full Indeed HTML (mosaic JSON) in ~10s.
+    // Trying residential first would burn 45s+ per attempt on a path that
+    // never works — so skip it for Indeed and hit ScraperAPI immediately.
+    if (board === "indeed") {
+      const target = getBoardSearchUrl(board, keyword, page, countryCode);
+      if (target && (await isScraperApiConfigured())) {
+        log(
+          `[scraperapi] ${board} p${page} — Indeed via ScraperAPI (render=false, skip residential)`,
+        );
+        const sa = await fetchViaScraperApi({
+          url: target,
+          countryCode,
+          log,
+        });
+        if (sa.ok && sa.html) return { ok: true, html: sa.html };
+        log(
+          `[scraperapi] ${board} ScraperAPI failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
+        );
+        return {
+          ok: false,
+          error: (sa.error ?? "upstream") as ProxyFailure["error"],
+          detail: sa.detail,
+        };
+      }
+      // No ScraperAPI key available → fall through to residential as a
+      // last resort (it may work from some networks).
+    }
+
     const retryable = ["rate_limited", "timeout", "upstream"];
     let lastErr: DirectProxyResult | null = null;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -92,8 +123,12 @@ export async function fetchBoardPage(opts: {
 
     // Residential exhausted → ScraperAPI (rotating IPs) is the reliable
     // final answer for datacenter-blocked boards. Skip Cloudflare worker.
+    // Only Indeed uses ScraperAPI — the other boards must never consume
+    // ScraperAPI credits (JobsDB/CTgoodjobs/OfferToday/LinkedIn resolve via
+    // residential/Cloudflare instead). (Indeed already tried ScraperAPI
+    // above, so this only runs for non-indeed dcBlocked boards.)
     const target = getBoardSearchUrl(board, keyword, page, countryCode);
-    if (target && isScraperApiConfigured()) {
+    if (board === "indeed" && target && (await isScraperApiConfigured())) {
       log(`[scraperapi] ${board} residential exhausted — trying ScraperAPI...`);
       const sa = await fetchViaScraperApi({ url: target, countryCode, log });
       if (sa.ok && sa.html) return { ok: true, html: sa.html };
@@ -190,8 +225,9 @@ export async function fetchBoardPage(opts: {
   );
 
   // ── Fallback 2 (FINAL): ScraperAPI — last resort for anti-bot-hard boards ──
+  // ONLY Indeed uses ScraperAPI; other boards resolve via residential/Cloudflare.
   const target = getBoardSearchUrl(board, keyword, page, countryCode);
-  if (target && isScraperApiConfigured()) {
+  if (board === "indeed" && target && (await isScraperApiConfigured())) {
     log(`[scraperapi] ${board} — trying ScraperAPI as final fallback...`);
     const sa = await fetchViaScraperApi({
       url: target,
@@ -295,9 +331,13 @@ export async function fetchJobDetail(opts: {
   );
 
   // ── Fallback 2 (FINAL): ScraperAPI for JS-heavy / hard-blocked detail pages ──
-  if (isScraperApiConfigured()) {
-    log(`[scraperapi] ${board} detail — trying ScraperAPI render=true...`);
-    const sa = await fetchViaScraperApi({ url, render: true, log });
+  // Only Indeed uses ScraperAPI — other boards must not spend ScraperAPI
+  // credits on detail fetches. render=false: Indeed's HTML (including the
+  // RPC description payload) is server-rendered; render=true hangs on
+  // Indeed's anti-bot and times out.
+  if (board === "indeed" && (await isScraperApiConfigured())) {
+    log(`[scraperapi] ${board} detail — trying ScraperAPI (render=false)...`);
+    const sa = await fetchViaScraperApi({ url, render: false, log });
     if (sa.ok && sa.html) return { ok: true, html: sa.html };
     log(
       `[scraperapi] ${board} detail ScraperAPI failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
@@ -393,9 +433,11 @@ export async function fetchViaProxy(opts: {
   if (direct.ok && direct.html) return { ok: true, html: direct.html };
 
   // ── Fallback 2 (FINAL): ScraperAPI ──
-  if (isScraperApiConfigured()) {
-    log(`[scraperapi] ${board} ${url} — trying ScraperAPI render=true...`);
-    const sa = await fetchViaScraperApi({ url, render: true, log });
+  // Only Indeed uses ScraperAPI; other boards never spend credits.
+  // render=false (render=true hangs on Indeed's anti-bot).
+  if (board === "indeed" && (await isScraperApiConfigured())) {
+    log(`[scraperapi] ${board} ${url} — trying ScraperAPI (render=false)...`);
+    const sa = await fetchViaScraperApi({ url, render: false, log });
     if (sa.ok && sa.html) return { ok: true, html: sa.html };
     log(
       `[scraperapi] ${board} ${url} ScraperAPI failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
