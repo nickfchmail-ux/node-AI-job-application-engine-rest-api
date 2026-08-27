@@ -22,7 +22,7 @@
 
 import { app, InvocationContext } from "@azure/functions";
 import { flushToSupabase, type PipelineWriteEvent } from "../batchedSupabase";
-import { finalizeRunIfDone } from "../supabase";
+import { finalizeActiveRunsForUsers } from "../supabase";
 import { notifyStateChange } from "../redisState";
 
 export const EVENT_HUB_NAME = "jobs";
@@ -56,24 +56,34 @@ app.eventHub("eventhub-jobs-batch-writer", {
 
     const result = await flushToSupabase(typed);
     console.info(
-      `[eventHubConsumer] flushed: ${result.jobs} jobs, ${result.boards} boards, ${result.counts} counts`,
+      `[eventHubConsumer] flushed: ${result.jobs} jobs, ${result.boards} boards, ${result.counts} counts (${result.failures.length} failures)`,
     );
 
-    // ── Finalize runs: after a batch flush, check whether any affected
-    //    run is now fully terminal → mark it completed promptly so the
-    //    user's run doesn't linger in "processing". Dedupe runIds.
-    const runIds = new Set(typed.map((ev) => ev.runId).filter(Boolean));
+    // ── CRITICAL: never advance the checkpoint past unpersisted events ──
+    // If any write failed, THROW so the Event Hub runtime does NOT checkpoint
+    // this batch — the events redeliver (at-least-once) and get retried.
+    if (result.failures.length > 0) {
+      console.error(
+        `[eventHubConsumer] ${result.failures.length} event(s) failed to persist — throwing so the batch redelivers (no data loss)`,
+      );
+      throw new Error(
+        `flushToSupabase failed for ${result.failures.length} event(s)`,
+      );
+    }
+
+    // ── Finalize runs (ROBUST): reconcile ALL active runs of the affected
+    //    users, not just this batch's runs. Handles parallel-board runs
+    //    whose last job landed in a different batch → completes promptly.
     const userIds = new Set(
       typed.filter((ev) => ev.op === "job" && ev.userId).map((ev) => (ev as { userId: string }).userId),
     );
-    for (const runId of runIds) {
-      await finalizeRunIfDone(runId).catch((err) =>
-        console.warn(`[eventHubConsumer] finalizeRunIfDone(${runId}) failed: ${err}`),
-      );
-    }
+    await finalizeActiveRunsForUsers(userIds);
+
     // ── Live socket nudge: tell the Express server to push fresh stats.
     for (const uid of userIds) {
-      await notifyStateChange(uid, [...runIds][0] ?? "").catch(() => {});
+      const runId =
+        typed.find((ev) => ev.op === "job" && ev.userId === uid)?.runId ?? "";
+      await notifyStateChange(uid, runId).catch(() => {});
     }
   },
 });

@@ -48,8 +48,13 @@ function getProducer(): EventHubProducerClient {
  * never blocks another. At-least-once — consumers must be idempotent
  * (they are: upsert on `url,user_id` + additive `increment_run_board`).
  *
- * Guards against a hung send with a timeout so callers never block
- * the pipeline on a dead Event Hub.
+ * ROBUSTNESS:
+ *  - Events are chunked into MULTIPLE batches per key if a run produces
+ *    more than one Event Hub batch's worth — nothing is dropped.
+ *  - A single event that exceeds the max batch size (huge job row) is
+ *    skipped with a LOUD warning; callers see `sent < total` and fall
+ *    back to a direct Supabase write (no silent loss).
+ *  - Guards against a hung send with a timeout.
  */
 export async function sendEvents(
   events: { key: string; body: unknown }[],
@@ -67,19 +72,48 @@ export async function sendEvents(
 
   let sent = 0;
   for (const [key, bodies] of byKey) {
-    const batch = await producer.createBatch({ partitionKey: key });
+    // Chunk into as many batches as needed (a run can exceed one batch).
+    let batch = await producer.createBatch({ partitionKey: key });
     for (const body of bodies) {
-      if (!batch.tryAdd({ body })) break;
-      sent++;
+      if (batch.tryAdd({ body })) {
+        sent++;
+        continue;
+      }
+      // Event didn't fit in the current batch. If the batch is empty the
+      // event itself exceeds the max size → skip with a loud warning.
+      if (batch.count === 0) {
+        console.error(
+          `[eventHub] event for partition '${key}' exceeds Event Hub max batch size — falling back to direct write`,
+        );
+        continue;
+      }
+      // Flush the full batch, start a new one, retry this event.
+      await sendBatch(producer, batch);
+      batch = await producer.createBatch({ partitionKey: key });
+      if (batch.tryAdd({ body })) {
+        sent++;
+      } else {
+        console.error(
+          `[eventHub] event for partition '${key}' exceeds Event Hub max batch size (even alone) — falling back to direct write`,
+        );
+      }
     }
     if (batch.count > 0) {
-      await Promise.race([
-        producer.sendBatch(batch),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Event Hub send timed out")), 30_000),
-        ),
-      ]);
+      await sendBatch(producer, batch);
     }
   }
   return sent;
+}
+
+/** Send a batch with a 30s timeout guard. */
+async function sendBatch(
+  producer: EventHubProducerClient,
+  batch: Parameters<EventHubProducerClient["sendBatch"]>[0],
+): Promise<void> {
+  await Promise.race([
+    producer.sendBatch(batch),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Event Hub send timed out")), 30_000),
+    ),
+  ]);
 }

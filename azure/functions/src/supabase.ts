@@ -186,6 +186,54 @@ export async function finalizeRunIfDone(
   return true;
 }
 
+/**
+ * Finalize any ACTIVE (non-terminal) run belonging to the given users that
+ * has all its jobs in a terminal state. This is the robustness net for
+ * PARALLEL-BOARD runs: the last board's jobs may finish in a DIFFERENT
+ * Event Hub batch than the earlier boards', so per-batch `finalizeRunIfDone`
+ * on the batch's own runs can miss the "all done" moment. This reconciles
+ * ALL the user's in-flight runs after every successful flush → runs complete
+ * promptly instead of waiting on the ~90s self-heal.
+ *
+ * Bounded: only queries the users in the current batch, only non-terminal
+ * runs, and stops at a sane limit. Best-effort (never throws).
+ */
+export async function finalizeActiveRunsForUsers(
+  userIds: Iterable<string>,
+): Promise<void> {
+  const users = [...new Set(userIds)].filter(Boolean);
+  if (users.length === 0) return;
+  const supabase = getSupabaseClient();
+
+  try {
+    // Active = non-terminal status. Limit defensively (a batch touches few
+    // users; never let a pathological batch sweep thousands of runs).
+    const { data: runs, error } = await supabase
+      .from("pipeline_runs")
+      .select("id, user_id")
+      .in("user_id", users)
+      .in("status", ["queued", "scraping", "processing", "retrying"])
+      .limit(50);
+
+    if (error) {
+      console.warn(
+        `[supabase] finalizeActiveRunsForUsers query failed: ${error.message}`,
+      );
+      return;
+    }
+
+    for (const run of runs ?? []) {
+      await finalizeRunIfDone(run.id as string).catch((err) =>
+        console.warn(
+          `[supabase] finalizeActiveRunsForUsers(finalize ${run.id}) failed: ${err}`,
+        ),
+      );
+    }
+  } catch (err) {
+    console.warn(`[supabase] finalizeActiveRunsForUsers threw: ${err}`);
+  }
+}
+
 /** Mark a run failed with an error message. */
 export async function markRunFailed(
   runId: string,
