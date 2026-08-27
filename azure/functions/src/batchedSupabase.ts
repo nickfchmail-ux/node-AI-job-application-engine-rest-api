@@ -68,7 +68,10 @@ export interface BoardCountEvent {
   };
 }
 
-export type PipelineWriteEvent = JobWriteEvent | BoardPatchEvent | BoardCountEvent;
+export type PipelineWriteEvent =
+  | JobWriteEvent
+  | BoardPatchEvent
+  | BoardCountEvent;
 
 /** Group raw events from a batch into per-run/per-board coalesced writes. */
 export function coalesceEvents(events: PipelineWriteEvent[]): {
@@ -84,7 +87,10 @@ export function coalesceEvents(events: PipelineWriteEvent[]): {
   // boards: key = `${runId}:${board}` → upsert one row per board per run
   const boards = new Map<string, Record<string, unknown>>();
   // counts: key = `${runId}:${board}` → sum deltas into one RPC call
-  const counts = new Map<string, { board: string; delta: Record<string, number> }>();
+  const counts = new Map<
+    string,
+    { board: string; delta: Record<string, number> }
+  >();
 
   for (const ev of events) {
     if (ev.op === "job") {
@@ -103,7 +109,10 @@ export function coalesceEvents(events: PipelineWriteEvent[]): {
       }
     } else if (ev.op === "board-patch") {
       const key = `${ev.runId}:${ev.board}`;
-      const existing = boards.get(key) ?? { run_id: ev.runId, board_key: ev.board };
+      const existing = boards.get(key) ?? {
+        run_id: ev.runId,
+        board_key: ev.board,
+      };
       boards.set(key, { ...existing, ...ev.patch });
     } else if (ev.op === "board-count") {
       const key = `${ev.runId}:${ev.board}`;
@@ -125,7 +134,12 @@ export function coalesceEvents(events: PipelineWriteEvent[]): {
  */
 export async function flushToSupabase(
   events: PipelineWriteEvent[],
-): Promise<{ jobs: number; boards: number; counts: number; failures: PipelineWriteEvent[] }> {
+): Promise<{
+  jobs: number;
+  boards: number;
+  counts: number;
+  failures: PipelineWriteEvent[];
+}> {
   const { jobs, boards, counts } = coalesceEvents(events);
   const supabase = getSupabaseClient();
   const failures: PipelineWriteEvent[] = [];
@@ -162,9 +176,7 @@ export async function flushToSupabase(
           );
           // Fail the whole group's events so the consumer retries them.
           failures.push(
-            ...events.filter(
-              (ev) => ev.op === "job" && ev.runId === runId,
-            ),
+            ...events.filter((ev) => ev.op === "job" && ev.runId === runId),
           );
           continue;
         }
@@ -185,24 +197,25 @@ export async function flushToSupabase(
         .from("run_boards")
         .upsert(row, { onConflict: "run_id,board_key" });
       if (error) {
-        console.error(`[batchedSupabase] run_boards upsert(${key}) failed: ${error.message}`);
+        console.error(
+          `[batchedSupabase] run_boards upsert(${key}) failed: ${error.message}`,
+        );
         failures.push(
           ...events.filter(
             (ev) =>
-              ev.op === "board-patch" &&
-              `${ev.runId}:${ev.board}` === key,
+              ev.op === "board-patch" && `${ev.runId}:${ev.board}` === key,
           ),
         );
         continue;
       }
       boardsWritten++;
     } catch (err) {
-      console.error(`[batchedSupabase] run_boards upsert(${key}) threw: ${err}`);
+      console.error(
+        `[batchedSupabase] run_boards upsert(${key}) threw: ${err}`,
+      );
       failures.push(
         ...events.filter(
-          (ev) =>
-            ev.op === "board-patch" &&
-            `${ev.runId}:${ev.board}` === key,
+          (ev) => ev.op === "board-patch" && `${ev.runId}:${ev.board}` === key,
         ),
       );
     }
@@ -220,28 +233,34 @@ export async function flushToSupabase(
         p_duplicate: c.delta.duplicate ?? 0,
       });
       if (error) {
-        console.error(`[batchedSupabase] increment_run_board(${key}) failed: ${error.message}`);
+        console.error(
+          `[batchedSupabase] increment_run_board(${key}) failed: ${error.message}`,
+        );
         failures.push(
           ...events.filter(
             (ev) =>
-              ev.op === "board-count" &&
-              `${ev.runId}:${ev.board}` === key,
+              ev.op === "board-count" && `${ev.runId}:${ev.board}` === key,
           ),
         );
         continue;
       }
       countsWritten++;
     } catch (err) {
-      console.error(`[batchedSupabase] increment_run_board(${key}) threw: ${err}`);
+      console.error(
+        `[batchedSupabase] increment_run_board(${key}) threw: ${err}`,
+      );
       failures.push(
         ...events.filter(
-          (ev) =>
-            ev.op === "board-count" &&
-            `${ev.runId}:${ev.board}` === key,
+          (ev) => ev.op === "board-count" && `${ev.runId}:${ev.board}` === key,
         ),
       );
     }
   }
 
-  return { jobs: jobsWritten, boards: boardsWritten, counts: countsWritten, failures };
+  return {
+    jobs: jobsWritten,
+    boards: boardsWritten,
+    counts: countsWritten,
+    failures,
+  };
 }

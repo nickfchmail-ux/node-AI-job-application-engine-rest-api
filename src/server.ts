@@ -78,7 +78,9 @@ app.post("/webhook/invalidate", async (req: Request, res: Response) => {
     ]);
     res.json({ ok: true });
   } catch (err) {
-    console.warn(`[webhook] invalidate(${userId}/${runId ?? "-"}) failed: ${err}`);
+    console.warn(
+      `[webhook] invalidate(${userId}/${runId ?? "-"}) failed: ${err}`,
+    );
     res.status(500).json({ error: "invalidate failed" });
   }
 });

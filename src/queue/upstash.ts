@@ -166,7 +166,12 @@ async function cacheSet(
   try {
     const client = getClient();
     const raw = typeof value === "string" ? value : JSON.stringify(value);
-    await client.request(["SETEX", cacheKey(name, id), String(ttlSeconds), raw]);
+    await client.request([
+      "SETEX",
+      cacheKey(name, id),
+      String(ttlSeconds),
+      raw,
+    ]);
   } catch (err) {
     console.warn(`[upstash] cacheSet ${name}:${id} failed: ${err}`);
   }

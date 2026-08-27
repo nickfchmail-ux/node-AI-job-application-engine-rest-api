@@ -17,6 +17,7 @@
 import { app, InvocationContext } from "@azure/functions";
 import { fetchJobDetail } from "../cloudflareProxy";
 import { enrichOneJob } from "../enrich";
+import { bufferWrite } from "../eventHubSink";
 import { canonicalizeUrl } from "../normalize";
 import {
   fetchIndeedBatchDescriptionsApi,
@@ -25,13 +26,8 @@ import {
 } from "../publicApiScrapers";
 import { incrementCounters } from "../redisState";
 import { bumpRunBoardCounts } from "../runBoardState";
-import {
-  finalizeRunIfDone,
-  getSupabaseClient,
-  updateJobStatusByUrl,
-} from "../supabase";
+import { updateJobStatusByUrl } from "../supabase";
 import type { JobMessage } from "../types";
-import { bufferWrite } from "../eventHubSink";
 
 /**
  * Classify an error as TRANSIENT (upstream / network / anti-bot — retryable

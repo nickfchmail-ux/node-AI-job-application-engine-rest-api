@@ -170,8 +170,7 @@ export async function finalizeRunIfDone(
 
   // A job stuck in `retrying` is NOT terminal — Service Bus will redeliver
   // and eventually flip it to completed/failed. Don't finalize the run early.
-  const allDone =
-    data.length > 0 && data.every((r) => terminal.has(r.status));
+  const allDone = data.length > 0 && data.every((r) => terminal.has(r.status));
   if (!allDone) return false;
 
   log(

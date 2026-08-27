@@ -22,8 +22,8 @@
 
 import { app, InvocationContext } from "@azure/functions";
 import { flushToSupabase, type PipelineWriteEvent } from "../batchedSupabase";
-import { finalizeActiveRunsForUsers } from "../supabase";
 import { notifyStateChange } from "../redisState";
+import { finalizeActiveRunsForUsers } from "../supabase";
 
 export const EVENT_HUB_NAME = "jobs";
 
@@ -75,7 +75,9 @@ app.eventHub("eventhub-jobs-batch-writer", {
     //    users, not just this batch's runs. Handles parallel-board runs
     //    whose last job landed in a different batch → completes promptly.
     const userIds = new Set(
-      typed.filter((ev) => ev.op === "job" && ev.userId).map((ev) => (ev as { userId: string }).userId),
+      typed
+        .filter((ev) => ev.op === "job" && ev.userId)
+        .map((ev) => (ev as { userId: string }).userId),
     );
     await finalizeActiveRunsForUsers(userIds);
 
