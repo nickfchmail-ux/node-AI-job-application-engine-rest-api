@@ -20,10 +20,10 @@
 //  still works during local dev / misconfiguration.
 // ============================================================
 
-import { sendEvents } from "./eventHub";
 import { flushToSupabase, type PipelineWriteEvent } from "./batchedSupabase";
-import { finalizeActiveRunsForUsers } from "./supabase";
+import { sendEvents } from "./eventHub";
 import { notifyStateChange } from "./redisState";
+import { finalizeActiveRunsForUsers } from "./supabase";
 
 const MAX_PENDING = 50; // flush when 50 intents accumulated
 const FLUSH_MS = 2000; // or every 2s, whichever first
@@ -40,14 +40,17 @@ let _flushPromise: Promise<void> | null = null;
 function isEventHubConfigured(): boolean {
   return Boolean(
     process.env.EventHub__connectionString ||
-      process.env.EventHub__fullyQualifiedNamespace,
+    process.env.EventHub__fullyQualifiedNamespace,
   );
 }
 
 /** Push intents into the buffer and maybe flush. */
 export function bufferWrite(...events: PipelineWriteEvent[]): void {
   _buffer.push(...events);
-  if (_buffer.length >= MAX_PENDING || Date.now() - _lastFlush >= MAX_BUFFER_MS) {
+  if (
+    _buffer.length >= MAX_PENDING ||
+    Date.now() - _lastFlush >= MAX_BUFFER_MS
+  ) {
     void flushNow();
     return;
   }
@@ -133,7 +136,9 @@ export function flushNow(): Promise<void> {
         // Direct-write failures are logged but not rethrown (best-effort
         // fallback; the primary path is the durable Event Hub consumer).
       } catch (fallbackErr) {
-        console.error(`[eventHubSink] direct fallback also failed: ${fallbackErr}`);
+        console.error(
+          `[eventHubSink] direct fallback also failed: ${fallbackErr}`,
+        );
       }
     }
   })().finally(() => {

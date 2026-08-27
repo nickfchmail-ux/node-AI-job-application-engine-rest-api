@@ -11,10 +11,10 @@
 //  the consumer — NOT one Supabase call per stage bump.
 // ============================================================
 
-import { getSupabaseClient } from "./supabase";
-import { notifyStateChange } from "./redisState";
-import { bufferWrite } from "./eventHubSink";
 import type { BoardPatchEvent } from "./batchedSupabase";
+import { bufferWrite } from "./eventHubSink";
+import { notifyStateChange } from "./redisState";
+import { getSupabaseClient } from "./supabase";
 
 export type RunBoardStage =
   | "pending"
@@ -52,7 +52,9 @@ async function getRunUserId(runId: string): Promise<string | null> {
       .eq("id", runId)
       .maybeSingle();
     if (error) {
-      console.warn(`[runBoardState] user lookup(${runId}) failed: ${error.message}`);
+      console.warn(
+        `[runBoardState] user lookup(${runId}) failed: ${error.message}`,
+      );
       return null;
     }
     const uid = data?.user_id ? String(data.user_id) : null;

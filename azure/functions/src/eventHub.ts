@@ -31,7 +31,11 @@ function getProducer(): EventHubProducerClient {
   } else if (fqns && credentialType === "managedidentity") {
     const { DefaultAzureCredential } =
       require("@azure/identity") as typeof import("@azure/identity");
-    _producer = new EventHubProducerClient(fqns, EVENT_HUB_NAME, new DefaultAzureCredential());
+    _producer = new EventHubProducerClient(
+      fqns,
+      EVENT_HUB_NAME,
+      new DefaultAzureCredential(),
+    );
   } else {
     throw new Error(
       "Event Hubs not configured. Set EventHub__connectionString (local) or EventHub__fullyQualifiedNamespace + EventHub__credential=managedidentity (prod).",

@@ -46,9 +46,7 @@ async function getRunStatuses(userId: string): Promise<Record<string, string>> {
       console.warn(`[stats] pipeline_runs status failed: ${error.message}`);
       return {};
     }
-    return Object.fromEntries(
-      (data ?? []).map((r) => [r.id, r.status]),
-    );
+    return Object.fromEntries((data ?? []).map((r) => [r.id, r.status]));
   } catch (err) {
     console.warn(`[stats] getRunStatuses failed: ${err}`);
     return {};

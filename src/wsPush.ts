@@ -210,7 +210,9 @@ async function getRunBoardDetail(runId: string): Promise<{
         if (rowErr)
           console.warn(`[ws] run_boards(${runId}) failed: ${rowErr.message}`);
         if (runErr)
-          console.warn(`[ws] pipeline_runs(${runId}) failed: ${runErr.message}`);
+          console.warn(
+            `[ws] pipeline_runs(${runId}) failed: ${runErr.message}`,
+          );
         return {
           rows: (rows ?? []) as Record<string, unknown>[],
           requested: ((run?.boards as string[]) ?? []) as string[],
