@@ -25,10 +25,17 @@ import {
 const router = Router();
 router.use(requireAuth);
 
-/** Cache of runId → pipeline_runs.status, fetched once per request. */
-let _statusCache: Record<string, string> = {};
+/**
+ * Fetch the runId → pipeline_runs.status map for a user, straight from
+ * Supabase on EVERY call (no module-level cache).
+ *
+ * ⚠️ There was a bug here: a module-level `_statusCache` persisted across
+ * requests and was never invalidated, so a run that was `queued`/`processing`
+ * at first load stayed "In line…" in the UI forever — even after the run
+ * reached `completed` in the database — until the server restarted. The
+ * frontend refreshes /stats/runs every 60s; it must see the CURRENT status.
+ */
 async function getRunStatuses(userId: string): Promise<Record<string, string>> {
-  if (Object.keys(_statusCache).length > 0) return _statusCache;
   try {
     const supabase = getSupabaseClient();
     const { data, error } = await supabase
@@ -37,17 +44,15 @@ async function getRunStatuses(userId: string): Promise<Record<string, string>> {
       .eq("user_id", userId);
     if (error) {
       console.warn(`[stats] pipeline_runs status failed: ${error.message}`);
-      _statusCache = {};
-    } else {
-      _statusCache = Object.fromEntries(
-        (data ?? []).map((r) => [r.id, r.status]),
-      );
+      return {};
     }
+    return Object.fromEntries(
+      (data ?? []).map((r) => [r.id, r.status]),
+    );
   } catch (err) {
     console.warn(`[stats] getRunStatuses failed: ${err}`);
-    _statusCache = {};
+    return {};
   }
-  return _statusCache;
 }
 
 /** Normalize a counters hash into a full funnel object (0 defaults). */
