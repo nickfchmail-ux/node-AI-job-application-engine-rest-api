@@ -1,5 +1,5 @@
-# Playwright official image includes all Chromium system dependencies
-FROM mcr.microsoft.com/playwright:v1.58.2-jammy
+# Node LTS — API server only (no Playwright / Chromium / worker)
+FROM node:18-alpine
 
 WORKDIR /app
 
@@ -7,17 +7,16 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
-# Install Playwright Chromium browser
-RUN npx playwright install chromium
-
 # Copy source
 COPY . .
 
-# Expose port (Railway sets $PORT automatically)
-EXPOSE 3000
+# Build TypeScript once — saves memory at runtime
+RUN npx tsc
 
-# Runs HTTP API server + pipeline worker in the same container.
-# Both share the browser pool (browserPool.ts) and connect to the same Redis.
-# To scale workers independently, deploy a second Railway service from this
-# image with CMD ["npx", "ts-node", "src/worker.ts"] and no EXPOSE.
-CMD ["npm", "run", "start:all"]
+# Render sets $PORT automatically
+ENV NODE_OPTIONS="--max-old-space-size=200"
+
+EXPOSE 8080
+
+# Run the API server (serves /auth, /stats, /jobs + Socket.io WebSocket push)
+CMD ["node", "dist/server.js"]
