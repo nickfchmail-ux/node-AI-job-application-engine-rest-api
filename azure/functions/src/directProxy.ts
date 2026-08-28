@@ -148,7 +148,10 @@ export async function fetchBoardDirect(opts: {
   const target = cfg.baseUrl + cfg.searchPath(keyword, page, countryCode);
   const agent = getAgent(proxyUrl);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45000);
+  // Cap residential attempts hard (default 20s, configurable) so a failing
+  // proxy path fails FAST and the circuit breaker can move to a working path.
+  const timeoutMs = Number(process.env.DATA_IMPULSE_TIMEOUT_MS ?? 20_000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const { statusCode, bodyText } = await requestViaProxy(

@@ -42,6 +42,60 @@ const MAX_ATTEMPTS = 3;
 const BASE_BACKOFF_MS = 1500;
 
 /**
+ * ── Circuit breaker / path memory ─────────────────────────────────────────
+ * Remembers which fetch path actually worked for each board so a board that
+ * is consistently blocked on one path (e.g. DataImpulse residential timing
+ * out from Azure) skips straight to the known-good path on the NEXT page or
+ * NEXT run — no wasted 45s timeouts per attempt.
+ *
+ * `pathScores[board][path]` counts successes; we pick the path with the
+ * highest success count first. A path that has NEVER succeeded is tried last
+ * (it might work for a different page/network), but a path with a bad streak
+ * of failures is deprioritised.
+ *
+ * This is in-process state (per function instance) — good enough for the
+ * steady-state within a single run and across a warm instance.
+ */
+type FetchPath = "residential" | "cloudflare" | "scraperapi" | "public";
+const pathScores: Record<string, Partial<Record<FetchPath, number>>> = {};
+const pathFailures: Record<string, Partial<Record<FetchPath, number>>> = {};
+
+function bumpPath(board: string, path: FetchPath, ok: boolean): void {
+  if (!pathScores[board]) pathScores[board] = {};
+  if (!pathFailures[board]) pathFailures[board] = {};
+  if (ok) {
+    pathScores[board]![path] = (pathScores[board]![path] ?? 0) + 1;
+    // A success clears the failure streak so a flaky path gets retried later.
+    pathFailures[board]![path] = 0;
+  } else {
+    pathFailures[board]![path] = (pathFailures[board]![path] ?? 0) + 1;
+  }
+}
+
+/** Order paths best-first using success counts, honouring a hard skip list. */
+function orderPaths(
+  board: string,
+  candidates: FetchPath[],
+  skip: FetchPath[] = [],
+): FetchPath[] {
+  const score = (p: FetchPath) => pathScores[board]?.[p] ?? 0;
+  const failStreak = (p: FetchPath) => pathFailures[board]?.[p] ?? 0;
+  return [...candidates]
+    .filter((p) => !skip.includes(p))
+    .sort((a, b) => {
+      // A path with a long failure streak is demoted hard (tried last).
+      const aBlocked = failStreak(a) >= 2 && score(a) === 0;
+      const bBlocked = failStreak(b) >= 2 && score(b) === 0;
+      if (aBlocked !== bBlocked) return aBlocked ? 1 : -1;
+      return score(b) - score(a);
+    });
+}
+
+/** Short helper: try a DataImpulse residential fetch with a hard per-attempt cap. */
+const RESIDENTIAL_ATTEMPT_TIMEOUT_MS = 20_000; // was 45s in directProxy — cap harder
+const RESIDENTIAL_MAX_ATTEMPTS = 2;
+
+/**
  * Fetch a job board search page through the Cloudflare proxy.
  * Retries on 5xx/blocked/challenge/timeout with exponential backoff,
  * honouring retryAfter seconds from the worker.
@@ -64,87 +118,116 @@ export async function fetchBoardPage(opts: {
   const pattern = getBoardPattern(board);
   const dcBlocked = pattern?.antiBot.datacenterBlocked === true;
   if (dcBlocked) {
-    // ── Indeed: go STRAIGHT to ScraperAPI (render=false). ──
-    // DataImpulse residential consistently times out from Azure (egress
-    // issue) AND gets a 403 Security Check from Indeed. ScraperAPI with
-    // render=false returns the full Indeed HTML (mosaic JSON) in ~10s.
-    // Trying residential first would burn 45s+ per attempt on a path that
-    // never works — so skip it for Indeed and hit ScraperAPI immediately.
-    if (board === "indeed") {
-      const target = getBoardSearchUrl(board, keyword, page, countryCode);
-      if (target && (await isScraperApiConfigured())) {
-        log(
-          `[scraperapi] ${board} p${page} — Indeed via ScraperAPI (render=false, skip residential)`,
-        );
-        const sa = await fetchViaScraperApi({
-          url: target,
-          countryCode,
-          log,
-        });
-        if (sa.ok && sa.html) return { ok: true, html: sa.html };
-        log(
-          `[scraperapi] ${board} ScraperAPI failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
-        );
-        return {
-          ok: false,
-          error: (sa.error ?? "upstream") as ProxyFailure["error"],
-          detail: sa.detail,
-        };
+    // ── Circuit-breaker-aware path ordering ────────────────────────────────
+    // Try paths in order of prior success, skipping known-dead ones. For
+    // datacenter-blocked boards the candidates are:
+    //   residential (DataImpulse) → scraperapi (paid, rotating IPs) → cloudflare
+    // The circuit breaker demotes a path with a failure streak so we don't
+    // burn 45s+ on residential when it has failed 2+ times already.
+    const candidates: FetchPath[] = ["residential", "scraperapi", "cloudflare"];
+    const ordered = orderPaths(board, candidates);
+    let lastErr: { error?: string; detail?: string } | null = null;
+
+    for (const path of ordered) {
+      if (path === "residential") {
+        const retryable = ["rate_limited", "timeout", "upstream"];
+        let residentialOk = false;
+        for (let attempt = 0; attempt < RESIDENTIAL_MAX_ATTEMPTS; attempt++) {
+          const direct = await fetchBoardDirect({
+            board,
+            keyword,
+            page,
+            countryCode,
+            log,
+          });
+          if (direct.ok && direct.html) {
+            residentialOk = true;
+            bumpPath(board, "residential", true);
+            log(
+              `[proxy] ${board} p${page} OK via residential (datacenter-blocked board)`,
+            );
+            return { ok: true, html: direct.html };
+          }
+          lastErr = direct;
+          const retry =
+            direct.error && retryable.includes(direct.error);
+          log(
+            `[proxy] ${board} residential attempt ${attempt + 1}/${RESIDENTIAL_MAX_ATTEMPTS} got ${direct.error}${direct.detail ? ` ${direct.detail}` : ""}${retry ? " — retrying" : ""}`,
+          );
+          if (!retry) break;
+          if (attempt < RESIDENTIAL_MAX_ATTEMPTS - 1) {
+            await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
+          }
+        }
+        if (!residentialOk) bumpPath(board, "residential", false);
       }
-      // No ScraperAPI key available → fall through to residential as a
-      // last resort (it may work from some networks).
+
+      if (path === "scraperapi") {
+        // ScraperAPI (rotating residential IPs) is the reliable paid answer
+        // for datacenter-blocked boards. Only Indeed previously used it, but
+        // JobsDB + CTgoodjobs are the user's most-searched boards and have NO
+        // free path when residential + Cloudflare both fail — so include them
+        // here too. OfferToday/LinkedIn resolve via public APIs (never here).
+        const scraperBoards = new Set(["indeed", "jobsdb", "ctgoodjobs"]);
+        const target = getBoardSearchUrl(board, keyword, page, countryCode);
+        if (scraperBoards.has(board) && target && (await isScraperApiConfigured())) {
+          log(`[scraperapi] ${board} p${page} — trying ScraperAPI (rotating IPs)...`);
+          const sa = await fetchViaScraperApi({ url: target, countryCode, log });
+          if (sa.ok && sa.html) {
+            bumpPath(board, "scraperapi", true);
+            return { ok: true, html: sa.html };
+          }
+          bumpPath(board, "scraperapi", false);
+          lastErr = {
+            error: sa.error ?? "upstream",
+            detail: sa.detail,
+          };
+          log(
+            `[scraperapi] ${board} ScraperAPI failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
+          );
+        }
+      }
+
+      if (path === "cloudflare") {
+        // Last resort for dcBlocked boards — the Cloudflare worker's datacenter
+        // egress usually 403s, but try it once (it may work for some networks).
+        const base = process.env.CLOUDFLARE_PROXY_URL;
+        if (base) {
+          const url = new URL(`/${board}`, base);
+          url.searchParams.set("keyword", keyword);
+          url.searchParams.set("page", String(page));
+          if (countryCode) url.searchParams.set("countryCode", countryCode);
+          try {
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), 15000);
+            const res = await fetch(url.toString(), {
+              headers: { Accept: "application/json" },
+              signal: controller.signal,
+            });
+            clearTimeout(t);
+            const body = (await res.json()) as ProxyResult;
+            if (body.ok) {
+              bumpPath(board, "cloudflare", true);
+              return body;
+            }
+            bumpPath(board, "cloudflare", false);
+            lastErr = { error: body.error, detail: body.detail };
+            log(`[proxy] ${board} Cloudflare worker: ${body.error}`);
+          } catch (err) {
+            bumpPath(board, "cloudflare", false);
+            log(`[proxy] ${board} Cloudflare worker fetch error: ${err}`);
+          }
+        }
+      }
     }
 
-    const retryable = ["rate_limited", "timeout", "upstream"];
-    let lastErr: DirectProxyResult | null = null;
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const direct = await fetchBoardDirect({
-        board,
-        keyword,
-        page,
-        countryCode,
-        log,
-      });
-      if (direct.ok && direct.html) {
-        log(`[proxy] ${board} p${page} OK via residential (datacenter-blocked board)`);
-        return { ok: true, html: direct.html };
-      }
-      lastErr = direct;
-      const retry = direct.error && retryable.includes(direct.error);
-      log(
-        `[proxy] ${board} residential attempt ${attempt + 1}/${MAX_ATTEMPTS} got ${direct.error}${direct.detail ? ` ${direct.detail}` : ""}${retry ? " — retrying" : ""}`,
-      );
-      if (!retry) break;
-      if (attempt < MAX_ATTEMPTS - 1) {
-        // DataImpulse rate-limit windows can be long — back off harder.
-        await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
-      }
-    }
-
-    // Residential exhausted → ScraperAPI (rotating IPs) is the reliable
-    // final answer for datacenter-blocked boards. Skip Cloudflare worker.
-    // Only Indeed uses ScraperAPI — the other boards must never consume
-    // ScraperAPI credits (JobsDB/CTgoodjobs/OfferToday/LinkedIn resolve via
-    // residential/Cloudflare instead). (Indeed already tried ScraperAPI
-    // above, so this only runs for non-indeed dcBlocked boards.)
-    const target = getBoardSearchUrl(board, keyword, page, countryCode);
-    if (board === "indeed" && target && (await isScraperApiConfigured())) {
-      log(`[scraperapi] ${board} residential exhausted — trying ScraperAPI...`);
-      const sa = await fetchViaScraperApi({ url: target, countryCode, log });
-      if (sa.ok && sa.html) return { ok: true, html: sa.html };
-      log(
-        `[scraperapi] ${board} ScraperAPI also failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
-      );
-      return {
-        ok: false,
-        error: (sa.error ?? lastErr?.error ?? "upstream") as ProxyFailure["error"],
-        detail: sa.detail ?? lastErr?.detail,
-      };
-    }
-
-    log(
-      `[proxy] ${board} residential-first failed — falling back to Cloudflare worker`,
-    );
+    // All paths failed on this page. Return the most useful error.
+    log(`[proxy] ${board} p${page} all paths failed`);
+    return {
+      ok: false,
+      error: (lastErr?.error ?? "upstream") as ProxyFailure["error"],
+      detail: lastErr?.detail,
+    };
   }
 
   const base = process.env.CLOUDFLARE_PROXY_URL;
@@ -159,6 +242,7 @@ export async function fetchBoardPage(opts: {
   url.searchParams.set("page", String(page));
   if (countryCode) url.searchParams.set("countryCode", countryCode);
 
+  let cloudflareFailed = false;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
@@ -170,12 +254,17 @@ export async function fetchBoardPage(opts: {
 
       const body = (await res.json()) as ProxyResult;
 
-      if (body.ok) return body;
+      if (body.ok) {
+        bumpPath(board, "cloudflare", true);
+        return body;
+      }
 
       // Hard anti-bot blocks — don't waste retries; break out to the
       // residential + ScraperAPI fallbacks below (so ScraperAPI is ALWAYS
       // tried as the final resort, even on a hard block).
       if (body.error === "blocked" || body.error === "challenge") {
+        cloudflareFailed = true;
+        bumpPath(board, "cloudflare", false);
         log(
           `[proxy] ${board} got ${body.error} — trying residential + ScraperAPI fallbacks`,
         );
@@ -187,6 +276,7 @@ export async function fetchBoardPage(opts: {
         body.error,
       );
       if (!retryable) {
+        bumpPath(board, "cloudflare", false);
         log(`[proxy] ${board} non-retryable error: ${body.error}`);
         return body;
       }
@@ -198,6 +288,7 @@ export async function fetchBoardPage(opts: {
       );
       await new Promise((r) => setTimeout(r, waitMs));
     } catch (err) {
+      cloudflareFailed = true;
       log(
         `[proxy] ${board} attempt ${attempt + 1}/${MAX_ATTEMPTS} fetch error: ${err}`,
       );
@@ -208,6 +299,7 @@ export async function fetchBoardPage(opts: {
   }
 
   log(`[proxy] ${board} gave up after ${MAX_ATTEMPTS} attempts`);
+  if (cloudflareFailed) bumpPath(board, "cloudflare", false);
 
   // ── Fallback 1: try the DataImpulse residential proxy directly ──
   const direct = await fetchBoardDirect({
@@ -218,23 +310,31 @@ export async function fetchBoardPage(opts: {
     log,
   });
   if (direct.ok && direct.html) {
+    bumpPath(board, "residential", true);
     return { ok: true, html: direct.html };
   }
+  bumpPath(board, "residential", false);
   log(
     `[proxy] ${board} direct fallback also failed: ${direct.error} detail=${direct.detail ?? ""}`,
   );
 
   // ── Fallback 2 (FINAL): ScraperAPI — last resort for anti-bot-hard boards ──
-  // ONLY Indeed uses ScraperAPI; other boards resolve via residential/Cloudflare.
+  // ScraperAPI rotating IPs are the reliable last answer for the datacenter-
+  // blocked boards (Indeed + the user's most-searched JobsDB/CTgoodjobs).
+  const scraperBoards = new Set(["indeed", "jobsdb", "ctgoodjobs"]);
   const target = getBoardSearchUrl(board, keyword, page, countryCode);
-  if (board === "indeed" && target && (await isScraperApiConfigured())) {
+  if (scraperBoards.has(board) && target && (await isScraperApiConfigured())) {
     log(`[scraperapi] ${board} — trying ScraperAPI as final fallback...`);
     const sa = await fetchViaScraperApi({
       url: target,
       countryCode,
       log,
     });
-    if (sa.ok && sa.html) return { ok: true, html: sa.html };
+    if (sa.ok && sa.html) {
+      bumpPath(board, "scraperapi", true);
+      return { ok: true, html: sa.html };
+    }
+    bumpPath(board, "scraperapi", false);
     log(
       `[scraperapi] ${board} ScraperAPI also failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
     );

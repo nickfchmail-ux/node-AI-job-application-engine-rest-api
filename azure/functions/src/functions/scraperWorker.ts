@@ -145,49 +145,65 @@ async function runScraper(
     // ── Per-board state: fetching ──
     await markBoardFetching(runId, board, body.pages).catch(() => {});
 
-    // Fetch all pages for this board concurrently
+    // ── Fetch pages SEQUENTIALLY with early-exit on hard anti-bot failure ──
+    // Page 1 is fetched first; if it hits a hard anti-bot error
+    // (blocked/challenge/rate_limited), pages 2+ WILL fail identically, so we
+    // STOP and don't waste proxy/ScraperAPI credits + wall-clock time fetching
+    // them. Public-API boards (offertoday/linkedin) are still sequential but
+    // cheap. This also avoids tripping rate-limits by bursting all pages at once.
     const pageNums = Array.from({ length: body.pages }, (_, i) => i + 1);
-    const results = await Promise.allSettled(
-      pageNums.map(async (page) => {
-        console.info(`[scraper] step: fetching ${board} page ${page}...`);
+    const results: (
+      | { status: "fulfilled"; value: { page: number; ok: boolean; jobs?: number; error?: string; errorType?: string } }
+      | { status: "rejected"; reason: unknown }
+    )[] = [];
+    const HARD_STOP_ERRORS = new Set(["blocked", "challenge", "rate_limited"]);
 
-        // ── Public API fast paths (bypass anti-bot HTML blocks) ──
-        if (board === "offertoday") {
-          const apiJobs = await scrapeOfferTodayApi(
-            body.keyword,
-            page,
-            console.log,
+    for (const page of pageNums) {
+      console.info(`[scraper] step: fetching ${board} page ${page}...`);
+      let pageResult:
+        | { page: number; ok: boolean; jobs?: number; error?: string; errorType?: string }
+        | undefined;
+
+      // ── Public API fast paths (bypass anti-bot HTML blocks) ──
+      if (board === "offertoday") {
+        const apiJobs = await scrapeOfferTodayApi(
+          body.keyword,
+          page,
+          console.log,
+        );
+        if (apiJobs.length > 0) {
+          for (const j of apiJobs) allJobs.push({ ...j, board });
+          console.info(
+            `[scraper] ${board} p${page}: ${apiJobs.length} jobs (via public API)`,
           );
-          if (apiJobs.length > 0) {
-            for (const j of apiJobs) allJobs.push({ ...j, board });
-            console.info(
-              `[scraper] ${board} p${page}: ${apiJobs.length} jobs (via public API)`,
-            );
-            return { page, ok: true as const, jobs: apiJobs.length };
-          }
+          pageResult = { page, ok: true, jobs: apiJobs.length };
+        } else {
           console.warn(
             `[scraper] ${board} public API empty — falling back to HTML proxy`,
           );
         }
+      }
 
-        if (board === "linkedin") {
-          const apiJobs = await scrapeLinkedInApi(
-            body.keyword,
-            page,
-            console.log,
+      if (!pageResult && board === "linkedin") {
+        const apiJobs = await scrapeLinkedInApi(
+          body.keyword,
+          page,
+          console.log,
+        );
+        if (apiJobs.length > 0) {
+          for (const j of apiJobs) allJobs.push({ ...j, board });
+          console.info(
+            `[scraper] ${board} p${page}: ${apiJobs.length} jobs (via guest API)`,
           );
-          if (apiJobs.length > 0) {
-            for (const j of apiJobs) allJobs.push({ ...j, board });
-            console.info(
-              `[scraper] ${board} p${page}: ${apiJobs.length} jobs (via guest API)`,
-            );
-            return { page, ok: true as const, jobs: apiJobs.length };
-          }
+          pageResult = { page, ok: true, jobs: apiJobs.length };
+        } else {
           console.warn(
             `[scraper] ${board} guest API empty — falling back to HTML proxy`,
           );
         }
+      }
 
+      if (!pageResult) {
         const result = await fetchBoardPage({
           board,
           keyword: body.keyword,
@@ -202,30 +218,41 @@ async function runScraper(
         if (!result.ok) {
           const err = `board ${board} page ${page}: ${result.error}${result.detail ? ` (${result.detail})` : ""}`;
           console.warn(`[scraper] ${err}`);
-          return {
+          pageResult = {
             page,
-            ok: false as const,
+            ok: false,
             error: err,
             errorType: result.error,
           };
-        }
-
-        // ── Per-board state: extracting ──
-        await markBoardExtracting(runId, board, page).catch(() => {});
-
-        try {
-          const jobs = extractListings(board, result.html);
-          for (const j of jobs) {
-            allJobs.push({ ...j, board });
+        } else {
+          // ── Per-board state: extracting ──
+          await markBoardExtracting(runId, board, page).catch(() => {});
+          try {
+            const jobs = extractListings(board, result.html);
+            for (const j of jobs) {
+              allJobs.push({ ...j, board });
+            }
+            console.info(`[scraper] ${board} p${page}: ${jobs.length} jobs`);
+            pageResult = { page, ok: true, jobs: jobs.length };
+          } catch (err) {
+            console.warn(`[scraper] parse error ${board} p${page}: ${err}`);
+            pageResult = { page, ok: false, error: String(err) };
           }
-          console.info(`[scraper] ${board} p${page}: ${jobs.length} jobs`);
-          return { page, ok: true as const, jobs: jobs.length };
-        } catch (err) {
-          console.warn(`[scraper] parse error ${board} p${page}: ${err}`);
-          return { page, ok: false as const, error: String(err) };
         }
-      }),
-    );
+      }
+
+      results.push({ status: "fulfilled", value: pageResult });
+      // Early-exit: a hard anti-bot failure on THIS page means remaining pages
+      // will fail the same way — stop fetching them.
+      if (pageResult && !pageResult.ok && pageResult.errorType) {
+        if (HARD_STOP_ERRORS.has(pageResult.errorType)) {
+          console.info(
+            `[scraper] ${board} hit ${pageResult.errorType} on page ${page} — skipping pages ${page + 1}-${body.pages} (identical failure)`,
+          );
+          break;
+        }
+      }
+    }
 
     // ── Collect errors from this board's pages ──
     let boardBlocked = false;
@@ -236,16 +263,18 @@ async function runScraper(
         boardErrors.push(msg);
         if (!firstError) firstError = msg;
       } else if (!r.value.ok) {
-        boardErrors.push(r.value.error);
-        if (!firstError) firstError = r.value.error;
+        const err = r.value.error ?? `board ${board} page ${r.value.page} failed`;
+        const errType = r.value.errorType;
+        boardErrors.push(err);
+        if (!firstError) firstError = err;
         // Hard anti-bot → mark board blocked (retryable, not a hard fail)
         if (
-          r.value.errorType === "blocked" ||
-          r.value.errorType === "challenge" ||
-          r.value.errorType === "rate_limited"
+          errType === "blocked" ||
+          errType === "challenge" ||
+          errType === "rate_limited"
         ) {
           boardBlocked = true;
-          await markBoardBlocked(runId, board, r.value.error).catch(() => {});
+          await markBoardBlocked(runId, board, err).catch(() => {});
         }
       }
     }
