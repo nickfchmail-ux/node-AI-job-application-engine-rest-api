@@ -29,7 +29,7 @@ import {
   markBoardFailed,
   markBoardFetching,
 } from "../runBoardState";
-import { enqueue } from "../serviceBus";
+import { enqueue } from "../storageQueue";
 import {
   getSupabaseClient,
   markRunCompleted,
@@ -45,46 +45,75 @@ import type {
 } from "../types";
 import { recordRetryUsage, refundUsageById } from "../usage";
 
-app.serviceBusQueue("scrape-requests", {
+app.storageQueue("scrape-requests", {
   queueName: "scrape-requests",
-  connection: "ServiceBus",
+  connection: "AzureWebJobsStorage",
   handler: async (rawBody: unknown, context: InvocationContext) => {
-    const body = rawBody as ScrapeRequestMessage;
-    const runId = body.runId;
-
-    console.info(
-      `[scraper] run ${runId}: "${body.keyword}" boards=${body.boards.join(",")} pages=${body.pages}`,
-    );
-
-    // ── Redis: create run meta + mark active (user-keyed) ──
+    // Wrap the ENTIRE body so ANY error (including JSON.parse or a missing
+    // field) is captured, logged, and recorded on the run — never a silent
+    // crash to the poison queue with no trace.
     try {
-      await setRunMeta(body.userId, runId, {
-        runId,
-        userId: body.userId,
-        keyword: body.keyword,
-        pages: body.pages,
-        boards: body.boards,
-        countryCode: body.countryCode ?? null,
-        createdAt: new Date().toISOString(),
-      });
-    } catch {
-      // non-fatal
-    }
+      const rawStr =
+        typeof rawBody === "string"
+          ? rawBody
+          : typeof rawBody === "object" && rawBody !== null
+            ? JSON.stringify(rawBody)
+            : String(rawBody ?? "");
+      let body: ScrapeRequestMessage;
+      try {
+        body = JSON.parse(rawStr) as ScrapeRequestMessage;
+      } catch {
+        body = rawBody as ScrapeRequestMessage;
+      }
+      const runId = body.runId;
+      const boards = Array.isArray(body.boards) ? body.boards : [];
 
-    try {
-      await markRunScraping(runId);
-    } catch {
-      // non-fatal — supabase helper logs
-    }
+      console.info(
+        `[scraper] run ${runId}: "${body.keyword}" boards=${boards.join(",")} pages=${body.pages} rawType=${typeof rawBody}`,
+      );
 
-    try {
-      await runScraper(body, context);
-    } catch (err) {
-      const e = err as Error;
-      const detail = `${e.message}\n${e.stack ?? ""}`.slice(0, 2000);
-      console.error(`[scraper] run ${runId} CRASHED: ${detail}`);
-      await markRunFailed(runId, detail).catch(() => {});
-      throw err; // rethrow → Service Bus retry (up to maxDeliveryCount)
+      // ── Redis: create run meta + mark active (user-keyed) ──
+      try {
+        await setRunMeta(body.userId, runId, {
+          runId,
+          userId: body.userId,
+          keyword: body.keyword,
+          pages: body.pages,
+          boards,
+          countryCode: body.countryCode ?? null,
+          createdAt: new Date().toISOString(),
+        });
+      } catch {
+        // non-fatal
+      }
+
+      try {
+        await markRunScraping(runId);
+      } catch {
+        // non-fatal — supabase helper logs
+      }
+
+      try {
+        await runScraper({ ...body, boards }, context);
+      } catch (err) {
+        const e = err as Error;
+        const detail = `${e.message}\n${e.stack ?? ""}`.slice(0, 2000);
+        console.error(`[scraper] run ${runId} CRASHED: ${detail}`);
+        console.error(
+          `[scraper] rawBody type=${typeof rawBody} isStr=${
+            typeof rawBody === "string"
+          }`,
+        );
+        await markRunFailed(runId, detail).catch(() => {});
+        throw err; // rethrow → Storage Queue retry (up to maxDequeueCount)
+      }
+    } catch (outerErr) {
+      const e = outerErr as Error;
+      console.error(
+        `[scraper] FATAL pre-parse error: ${e.message}\n${e.stack ?? ""}`,
+      );
+      console.error(`[scraper] rawBody: ${String(rawBody).slice(0, 500)}`);
+      throw outerErr; // rethrow → Storage Queue retry (up to maxDequeueCount)
     }
   },
 });

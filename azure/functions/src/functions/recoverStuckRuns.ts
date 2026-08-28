@@ -44,7 +44,7 @@
 // ============================================================
 
 import { app, InvocationContext } from "@azure/functions";
-import { enqueue } from "../serviceBus";
+import { enqueue } from "../storageQueue";
 import { getSupabaseClient } from "../supabase";
 import type { JobMessage, RunSelfHealMessage } from "../types";
 
@@ -74,11 +74,14 @@ interface StaleRun {
   created_at: string | null;
 }
 
-app.serviceBusQueue("recover-stuck-runs", {
+app.storageQueue("recover-stuck-runs", {
   queueName: "jobs",
-  connection: "ServiceBus",
+  connection: "AzureWebJobsStorage",
   handler: async (rawBody: unknown, context: InvocationContext) => {
-    const msg = rawBody as Partial<RunSelfHealMessage>;
+    const msg =
+      typeof rawBody === "string"
+        ? (JSON.parse(rawBody) as Partial<RunSelfHealMessage>)
+        : (rawBody as Partial<RunSelfHealMessage>);
 
     // Only handle self-heal messages — ignore process-job messages that
     // share the same `jobs` queue (the job processor handles those).

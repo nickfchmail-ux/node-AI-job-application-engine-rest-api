@@ -14,13 +14,16 @@
     "version": "[4.*, 5.0.0)"
   },
   "extensions": {
-    "serviceBus": {
-      "maxConcurrentCalls": 16,
-      "prefetchCount": 32,
-      "maxConcurrentSessions": 200,
-      "maxMessageBatchSize": 1000,
-      "minMessageBatchSize": 1,
-      "maxBatchWaitTime": "00:00:10"
+    "queues": {
+      // Storage Queue triggers (FREE replacement for Service Bus).
+      // messageEncoding base64 matches what the producer base64-encodes.
+      // visibilityTimeout gives the scraper worker's board fetches
+      // (Cloudflare/DataImpulse) time to finish before re-delivery.
+      "visibilityTimeout": "00:05:00",
+      "maxDequeueCount": 5,
+      "batchSize": 4,
+      "newBatchThreshold": 2,
+      "messageEncoding": "base64"
     },
     "eventHubs": {
       "maxBatchSize": 1000,

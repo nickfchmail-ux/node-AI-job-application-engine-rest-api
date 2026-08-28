@@ -13,7 +13,7 @@ import {
   HttpResponseInit,
   InvocationContext,
 } from "@azure/functions";
-import { enqueue, ensureQueues } from "../serviceBus";
+import { enqueue, ensureQueues } from "../storageQueue";
 import { getSupabaseClient } from "../supabase";
 import type { ScrapeRequestMessage } from "../types";
 import { consumeUsage, refundUsage, UsageLimitReachedError } from "../usage";

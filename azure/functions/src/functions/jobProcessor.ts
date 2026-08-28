@@ -57,11 +57,14 @@ function isTransientError(err: unknown): boolean {
   return transient.some((t) => msg.includes(t));
 }
 
-app.serviceBusQueue("jobs", {
+app.storageQueue("jobs", {
   queueName: "jobs",
-  connection: "ServiceBus",
+  connection: "AzureWebJobsStorage",
   handler: async (rawBody: unknown, context: InvocationContext) => {
-    const body = rawBody as JobMessage;
+    const body =
+      typeof rawBody === "string"
+        ? (JSON.parse(rawBody) as JobMessage)
+        : (rawBody as JobMessage);
     const { jobId, runId, userId, board, scrapedJob, keyword, scrapedDate } =
       body;
 

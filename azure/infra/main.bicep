@@ -1,19 +1,19 @@
 // ============================================================
-//  Service Bus provisioning — main.bicep
+//  Jobs Automation provisioning — main.bicep
 //
 //  Creates:
-//    - Service Bus namespace (Standard tier)
-//    - scrape-requests queue
-//    - jobs queue
-//    - Storage account (Function App host)
+//    - Storage account (Function App host) — Storage Queues ($0) live here
 //    - Function App (Node 20, Consumption)
-//    - Managed identity + RBAC (Service Bus Data Sender/Receiver)
+//    - Event Hubs (write-batching layer)
+//    - Managed identity + RBAC (Event Hubs Sender/Receiver)
 //    - App Settings wiring (Supabase, DeepSeek, Cloudflare, secrets)
+//
+//  Migration 2026-08-28: Service Bus (~$10/mo) → Azure Storage Queues ($0).
+//  Queues are auto-created in the host storage account; no SB resources.
 // ============================================================
 
 param location string = resourceGroup().location
 param functionAppName string = 'jobsautomation-fn'
-param serviceBusNamespaceName string = 'jobsautomation-sbns'
 param eventHubNamespaceName string = 'jobsautomation-ehns'
 param eventHubName string = 'jobs'
 // (environment param removed — unused)
@@ -43,59 +43,6 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   properties: {
     supportsHttpsTrafficOnly: true
     minimumTlsVersion: 'TLS1_2'
-  }
-}
-
-// ── Service Bus namespace (Standard) ───────────────────────────
-resource serviceBusNamespace 'Microsoft.ServiceBus/namespaces@2022-10-01-preview' = {
-  name: serviceBusNamespaceName
-  location: location
-  sku: { name: 'Standard', tier: 'Standard' }
-  properties: {
-    minimumTlsVersion: '1.2'
-  }
-}
-
-// ── Queues ─────────────────────────────────────────────────────
-resource scrapeRequestsQueue 'Microsoft.ServiceBus/namespaces/queues@2022-10-01-preview' = {
-  name: 'scrape-requests'
-  parent: serviceBusNamespace
-  properties: {
-    maxSizeInMegabytes: 1024
-    defaultMessageTimeToLive: 'P2D'                 // 2 days
-    maxDeliveryCount: 5
-    duplicateDetectionHistoryTimeWindow: 'PT10M'    // 10 min dedup
-    deadLetteringOnMessageExpiration: true
-    enablePartitioning: true
-    lockDuration: 'PT1M'
-  }
-}
-
-resource jobsQueue 'Microsoft.ServiceBus/namespaces/queues@2022-10-01-preview' = {
-  name: 'jobs'
-  parent: serviceBusNamespace
-  properties: {
-    maxSizeInMegabytes: 1024
-    defaultMessageTimeToLive: 'P2D'
-    maxDeliveryCount: 5
-    duplicateDetectionHistoryTimeWindow: 'PT10M'
-    deadLetteringOnMessageExpiration: true
-    enablePartitioning: true
-    lockDuration: 'PT5M'  // job processing (DeepSeek) can be slow
-  }
-}
-
-resource resumeBuildsQueue 'Microsoft.ServiceBus/namespaces/queues@2022-10-01-preview' = {
-  name: 'resume-builds'
-  parent: serviceBusNamespace
-  properties: {
-    maxSizeInMegabytes: 1024
-    defaultMessageTimeToLive: 'P2D'
-    maxDeliveryCount: 5
-    duplicateDetectionHistoryTimeWindow: 'PT10M'
-    deadLetteringOnMessageExpiration: true
-    enablePartitioning: true
-    lockDuration: 'PT5M'  // resume generation (DeepSeek) can be slow
   }
 }
 
@@ -163,12 +110,6 @@ resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
         // Identity-based storage connection (no connection string in code)
         { name: 'AzureWebJobsStorage__accountName', value: storageAccount.name }
         { name: 'AzureWebJobsStorage__credential', value: 'managedidentity' }
-        {
-          name: 'ServiceBus__fullyQualifiedNamespace'
-          // strip scheme (https://) — @azure/service-bus wants bare hostname
-          value: replace(replace(serviceBusNamespace.properties.serviceBusEndpoint, 'https://', ''), '/', '')
-        }
-        { name: 'ServiceBus__credential', value: 'managedidentity' }
         { name: 'SUPABASE_URL', value: supabaseUrl }
         { name: 'SUPABASE_SERVICE_KEY', value: supabaseServiceKey }
         { name: 'SUPABASE_ANON_KEY', value: supabaseAnonKey }
@@ -209,27 +150,6 @@ resource ehReceiverRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     principalType: 'ServicePrincipal'
   }
 }
-// ── RBAC: Function App identity → Service Bus ──────────────────
-resource sbSenderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBusNamespace.id, functionAppName, 'sender')
-  scope: serviceBusNamespace
-  properties: {
-    roleDefinitionId: '/providers/Microsoft.Authorization/roleDefinitions/69a216fc-b8fb-44d8-bc22-1f3c2cd27a39' // Azure Service Bus Data Sender
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-resource sbReceiverRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBusNamespace.id, functionAppName, 'receiver')
-  scope: serviceBusNamespace
-  properties: {
-    roleDefinitionId: '/providers/Microsoft.Authorization/roleDefinitions/4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0' // Azure Service Bus Data Receiver
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
 // ── RBAC: Function App identity → Storage (Blob Data Contributor) ──
 resource storageBlobContributorRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storageAccount.id, functionAppName, 'storageblob')
@@ -244,8 +164,6 @@ resource storageBlobContributorRole 'Microsoft.Authorization/roleAssignments@202
 // ── Outputs ────────────────────────────────────────────────────
 output functionAppName_out string = functionAppName
 output functionAppDefaultHostName string = functionApp.properties.defaultHostName
-output serviceBusNamespaceName_out string = serviceBusNamespaceName
-output serviceBusEndpoint string = serviceBusNamespace.properties.serviceBusEndpoint
 output eventHubNamespaceName_out string = eventHubNamespaceName
 output eventHubEndpoint string = eventHubNamespace.properties.serviceBusEndpoint
 output eventHubName_out string = eventHub.name

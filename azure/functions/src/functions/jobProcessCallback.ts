@@ -16,7 +16,7 @@ import {
   HttpResponseInit,
   InvocationContext,
 } from "@azure/functions";
-import { enqueue } from "../serviceBus";
+import { enqueue } from "../storageQueue";
 import { getSupabaseClient } from "../supabase";
 import type { JobMessage } from "../types";
 

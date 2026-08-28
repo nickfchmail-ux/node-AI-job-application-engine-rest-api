@@ -15,7 +15,7 @@ import {
   HttpResponseInit,
   InvocationContext,
 } from "@azure/functions";
-import { enqueue } from "../serviceBus";
+import { enqueue } from "../storageQueue";
 
 app.http("generate-resume", {
   methods: ["POST"],

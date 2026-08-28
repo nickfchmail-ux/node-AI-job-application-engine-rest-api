@@ -20,11 +20,14 @@ interface ResumeBuildMessage {
   jobId: string;
 }
 
-app.serviceBusQueue("resume-builds", {
+app.storageQueue("resume-builds", {
   queueName: "resume-builds",
-  connection: "ServiceBus",
+  connection: "AzureWebJobsStorage",
   handler: async (rawBody: unknown, context: InvocationContext) => {
-    const body = rawBody as ResumeBuildMessage;
+    const body =
+      typeof rawBody === "string"
+        ? (JSON.parse(rawBody) as ResumeBuildMessage)
+        : (rawBody as ResumeBuildMessage);
     const jobId = body?.jobId;
     if (!jobId) {
       console.warn("[resume-build] message missing jobId");

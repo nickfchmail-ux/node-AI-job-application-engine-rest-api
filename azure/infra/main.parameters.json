@@ -5,9 +5,6 @@
     "functionAppName": {
       "value": "jobsautomation-fn"
     },
-    "serviceBusNamespaceName": {
-      "value": "jobsautomation-sbns"
-    },
     "location": {
       "value": "eastasia"
     },
