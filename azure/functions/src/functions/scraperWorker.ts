@@ -153,7 +153,16 @@ async function runScraper(
     // cheap. This also avoids tripping rate-limits by bursting all pages at once.
     const pageNums = Array.from({ length: body.pages }, (_, i) => i + 1);
     const results: (
-      | { status: "fulfilled"; value: { page: number; ok: boolean; jobs?: number; error?: string; errorType?: string } }
+      | {
+          status: "fulfilled";
+          value: {
+            page: number;
+            ok: boolean;
+            jobs?: number;
+            error?: string;
+            errorType?: string;
+          };
+        }
       | { status: "rejected"; reason: unknown }
     )[] = [];
     const HARD_STOP_ERRORS = new Set(["blocked", "challenge", "rate_limited"]);
@@ -161,7 +170,13 @@ async function runScraper(
     for (const page of pageNums) {
       console.info(`[scraper] step: fetching ${board} page ${page}...`);
       let pageResult:
-        | { page: number; ok: boolean; jobs?: number; error?: string; errorType?: string }
+        | {
+            page: number;
+            ok: boolean;
+            jobs?: number;
+            error?: string;
+            errorType?: string;
+          }
         | undefined;
 
       // ── Public API fast paths (bypass anti-bot HTML blocks) ──
@@ -263,7 +278,8 @@ async function runScraper(
         boardErrors.push(msg);
         if (!firstError) firstError = msg;
       } else if (!r.value.ok) {
-        const err = r.value.error ?? `board ${board} page ${r.value.page} failed`;
+        const err =
+          r.value.error ?? `board ${board} page ${r.value.page} failed`;
         const errType = r.value.errorType;
         boardErrors.push(err);
         if (!firstError) firstError = err;
@@ -693,12 +709,14 @@ async function runScraper(
 
   // ── EVENT-DRIVEN self-heal (NOT a timer) ─────────────────────
   // One-shot delayed check for THIS run: ~90s after the worker finishes, a
-  // `run-self-heal` message becomes visible on the `jobs` queue. When it
+  // `run-self-heal` message becomes visible on the `self-heal` queue. When it
   // fires, recover-stuck-runs re-enqueues any jobs that were enqueued but
-  // NEVER delivered (lost Service Bus message / worker crash). This is
-  // event-driven — ONE message per run, fires once, then gone. It never
-  // keeps the Function App warm or costs money when idle (unlike a recurring
-  // timer that runs every N minutes).
+  // NEVER delivered (lost message / worker crash). This is event-driven —
+  // ONE message per run, fires once, then gone. It never keeps the Function
+  // App warm or costs money when idle (unlike a recurring timer).
+  // NOTE: uses the SEPARATE `self-heal` queue, NOT `jobs` — two storage-queue
+  // triggers on `jobs` would split messages and recover-stuck-runs would
+  // swallow process-job messages, leaving jobs stuck at `queued`.
   try {
     const healMsg: RunSelfHealMessage = {
       type: "run-self-heal",
@@ -708,7 +726,7 @@ async function runScraper(
     // Delayed delivery so the job processor has time to work the queue
     // normally; the self-heal only steps in if jobs are STILL stuck.
     const delayMs = Number(process.env.SELF_HEAL_DELAY_MS ?? 90_000);
-    await enqueue("jobs", healMsg, {
+    await enqueue("selfHeal", healMsg, {
       messageId: `run-self-heal-${runId}`,
       ttlSeconds: 3600,
       scheduledEnqueueTimeUtc: new Date(Date.now() + delayMs),

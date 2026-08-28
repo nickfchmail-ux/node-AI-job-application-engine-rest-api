@@ -17,9 +17,11 @@
     "queues": {
       // Storage Queue triggers (FREE replacement for Service Bus).
       // messageEncoding base64 matches what the producer base64-encodes.
-      // visibilityTimeout gives the scraper worker's board fetches
-      // (Cloudflare/DataImpulse) time to finish before re-delivery.
-      "visibilityTimeout": "00:05:00",
+      // visibilityTimeout is 10min (matches functionTimeout) so a slow job
+      // detail fetch is NOT re-delivered mid-processing — a re-delivery loop
+      // (visibility < processing time) was stalling runs in `retrying` and
+      // never letting them finalize to `completed`.
+      "visibilityTimeout": "00:10:00",
       "maxDequeueCount": 5,
       "batchSize": 4,
       "newBatchThreshold": 2,

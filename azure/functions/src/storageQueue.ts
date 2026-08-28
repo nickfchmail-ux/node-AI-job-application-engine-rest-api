@@ -17,15 +17,18 @@
 //  Production: AzureWebJobsStorage=<existing function host storage>
 // ============================================================
 
-import {
-  QueueClient,
-  QueueServiceClient,
-} from "@azure/storage-queue";
+import { QueueClient, QueueServiceClient } from "@azure/storage-queue";
 
 const QUEUES = {
   scrapeRequests: "scrape-requests",
   jobs: "jobs",
   resumeBuilds: "resume-builds",
+  // Separate self-heal queue so recover-stuck-runs does NOT compete with the
+  // job processor for the `jobs` queue. Two storage-queue triggers on the same
+  // queue split messages between them; recover-stuck-runs would swallow
+  // process-job messages (it only handles run-self-heal) and drop them —
+  // leaving jobs stuck at `queued` and runs stuck in `retrying`.
+  selfHeal: "self-heal",
 } as const;
 
 let _serviceClient: QueueServiceClient | null = null;
@@ -92,9 +95,7 @@ export async function enqueue(
   const visibilityTimeout = opts.scheduledEnqueueTimeUtc
     ? Math.max(
         0,
-        Math.ceil(
-          (opts.scheduledEnqueueTimeUtc.getTime() - Date.now()) / 1000,
-        ),
+        Math.ceil((opts.scheduledEnqueueTimeUtc.getTime() - Date.now()) / 1000),
       )
     : undefined;
 
@@ -112,9 +113,7 @@ export async function enqueue(
       // Storage Queues assign the message ID server-side (unlike Service Bus),
       // so `messageId` is only our caller-facing trace id (returned below).
       ...(opts.ttlSeconds ? { messageTimeToLive: opts.ttlSeconds } : {}),
-      ...(visibilityTimeout !== undefined
-        ? { visibilityTimeout }
-        : {}),
+      ...(visibilityTimeout !== undefined ? { visibilityTimeout } : {}),
     }),
     new Promise<never>((_, reject) =>
       setTimeout(

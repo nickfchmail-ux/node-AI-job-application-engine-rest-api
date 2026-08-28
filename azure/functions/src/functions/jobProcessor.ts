@@ -93,56 +93,74 @@ app.storageQueue("jobs", {
     }
 
     try {
-      // ── 1. Fetch full job content ──
-      // The search listing only has a short snippet. For each job
-      // POST we scrape its DETAIL page to get the full description.
+      // ── 1. Fetch full job content (with a HARD time budget) ──
+      // The search listing only has a short snippet. For each job we scrape
+      // its DETAIL page to get the full description — BUT the proxy chain can
+      // be slow/rate-limited, and a job that hangs here stalls the whole run
+      // (never reaching `completed`, so the user can't Match it). We give the
+      // detail fetch a bounded budget; on expiry we proceed with just the
+      // listing data (title/company/snippet) so the job still completes and
+      // the run can finalize. The detail is enriched later on demand.
+      const DETAIL_BUDGET_MS = Number(process.env.JOB_DETAIL_BUDGET_MS ?? 25_000);
       let rawDetailHtml: string | undefined = scrapedJob.rawDetailHtml;
 
       if (!rawDetailHtml) {
-        // LinkedIn + OfferToday have public guest/detail APIs that
-        // bypass anti-bot blocks — use those first.
-        if (board === "linkedin") {
-          const jobIdMatch = scrapedJob.url.match(/\/view\/(\d+)/);
-          if (jobIdMatch) {
-            const desc = await fetchLinkedInDescriptionApi(
-              jobIdMatch[1],
-              console.log,
-            );
-            if (desc) rawDetailHtml = desc;
+        const fetchDetail = async (): Promise<string | undefined> => {
+          // LinkedIn + OfferToday have public guest/detail APIs that
+          // bypass anti-bot blocks — use those first.
+          if (board === "linkedin") {
+            const jobIdMatch = scrapedJob.url.match(/\/view\/(\d+)/);
+            if (jobIdMatch) {
+              const desc = await fetchLinkedInDescriptionApi(
+                jobIdMatch[1],
+                console.log,
+              );
+              if (desc) return desc;
+            }
+          } else if (board === "offertoday") {
+            const jobIdMatch = scrapedJob.url.match(/\/job\/([^/]+)/);
+            if (jobIdMatch) {
+              const desc = await fetchOfferTodayDescriptionApi(
+                jobIdMatch[1],
+                console.log,
+              );
+              if (desc) return desc;
+            }
+          } else if (board === "indeed") {
+            // Indeed: batch-fetch via the RPC endpoint routed through the
+            // Cloudflare proxy (single call for many jobs instead of N detail
+            // fetches). The scraper worker pre-fetches these before fan-out.
+            const jobkey = scrapedJob.url.match(/jk=([a-f0-9]{16})/)?.[1];
+            if (jobkey) {
+              const descs = await fetchIndeedBatchDescriptionsApi(
+                [jobkey],
+                console.log,
+              );
+              if (descs[jobkey]) return descs[jobkey];
+            }
           }
-        } else if (board === "offertoday") {
-          const jobIdMatch = scrapedJob.url.match(/\/job\/([^/]+)/);
-          if (jobIdMatch) {
-            const desc = await fetchOfferTodayDescriptionApi(
-              jobIdMatch[1],
-              console.log,
-            );
-            if (desc) rawDetailHtml = desc;
-          }
-        } else if (board === "indeed") {
-          // Indeed: batch-fetch via the RPC endpoint routed through the
-          // Cloudflare proxy (single call for many jobs instead of N detail
-          // fetches). The scraper worker pre-fetches these before fan-out;
-          // this is a lazy fallback if a job somehow lacks rawDetailHtml.
-          const jobkey = scrapedJob.url.match(/jk=([a-f0-9]{16})/)?.[1];
-          if (jobkey) {
-            const descs = await fetchIndeedBatchDescriptionsApi(
-              [jobkey],
-              console.log,
-            );
-            if (descs[jobkey]) rawDetailHtml = descs[jobkey];
-          }
-        }
 
-        // Fallback: Cloudflare proxy / residential proxy detail fetch
-        if (!rawDetailHtml) {
+          // Fallback: Cloudflare proxy / residential proxy detail fetch
           const detailResult = await fetchJobDetail({
             board,
             url: scrapedJob.url,
             log: console.log,
           });
-          if (detailResult.ok) rawDetailHtml = detailResult.html;
-        }
+          if (detailResult.ok) return detailResult.html;
+          return undefined;
+        };
+
+        rawDetailHtml = await Promise.race([
+          fetchDetail(),
+          new Promise<undefined>((resolve) =>
+            setTimeout(() => {
+              console.warn(
+                `[processor] job ${jobId} detail fetch exceeded ${DETAIL_BUDGET_MS}ms budget — completing with listing data only`,
+              );
+              resolve(undefined);
+            }, DETAIL_BUDGET_MS),
+          ),
+        ]);
       }
 
       // ── 2. Enrich — parse description into structured detail ──

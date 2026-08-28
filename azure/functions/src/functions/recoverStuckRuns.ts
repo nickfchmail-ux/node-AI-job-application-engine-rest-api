@@ -75,7 +75,7 @@ interface StaleRun {
 }
 
 app.storageQueue("recover-stuck-runs", {
-  queueName: "jobs",
+  queueName: "self-heal",
   connection: "AzureWebJobsStorage",
   handler: async (rawBody: unknown, context: InvocationContext) => {
     const msg =
@@ -131,7 +131,7 @@ app.storageQueue("recover-stuck-runs", {
         );
         try {
           await enqueue(
-            "jobs",
+            "selfHeal",
             {
               type: "run-self-heal",
               runId,
