@@ -68,28 +68,29 @@ router.post("/refresh", async (req: Request, res: Response) => {
     const { data, error } = await supabase.auth.refreshSession({
       refresh_token,
     });
-
-    // Genuinely invalid / expired refresh token → 401 so the client KNOWS the
-    // session is gone and can clear cookies / send the user to login.
-    if (error) {
-      // Supabase AuthApiError: `status` is the HTTP code from GoTrue.
+    if (error || !data.session) {
+      // Genuinely invalid / expired refresh token → 401 so the client KNOWS
+      // the session is dead and must re-login. Distinguish this from
+      // TRANSIENT failures (Supabase degraded / network blip) by the AuthApi
+      // error's HTTP status and message — a transient failure must NEVER
+      // log the user out (the earlier version returned 401 for everything,
+      // which force-cleared cookies during Supabase incidents → auto-logout
+      // loops).
       const status = (error as { status?: number }).status;
-      if (status === 401 || /invalid|expired|not found/i.test(error.message)) {
-        res.status(401).json({ error: error.message });
+      if (
+        status === 401 ||
+        /invalid|expired|not found|invalid JWT|token has expired/i.test(
+          error?.message ?? "",
+        )
+      ) {
+        res.status(401).json({ error: error?.message ?? "Token refresh failed" });
         return;
       }
-      // Anything else (network, 5xx from GoTrue, incident) is TRANSIENT — the
-      // refresh token may still be valid. Return 503 so clients do NOT log
-      // the user out; they can retry.
-      res.status(503).json({ error: error.message });
+      // Transient (e.g. GoTrue 5xx, timeout) — the refresh token may still be
+      // valid. Return 503 so clients do NOT log the user out.
+      res.status(503).json({ error: error?.message ?? "Token refresh failed" });
       return;
     }
-
-    if (!data.session) {
-      res.status(401).json({ error: "Token refresh failed" });
-      return;
-    }
-
     res.json({
       access_token: data.session.access_token,
       refresh_token: data.session.refresh_token,
@@ -98,8 +99,8 @@ router.post("/refresh", async (req: Request, res: Response) => {
       user: { id: data.user!.id, email: data.user!.email },
     });
   } catch (err) {
-    // Thrown errors are usually network-level (Supabase unreachable) →
-    // transient, not a bad token.
+    // Network / upstream error — the token may still be valid. 503, not 401,
+    // so the client keeps the session and retries.
     res.status(503).json({ error: (err as Error).message });
   }
 });
