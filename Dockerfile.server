@@ -2,6 +2,12 @@ FROM node:18-alpine
 
 WORKDIR /app
 
+# Playwright is a dependency of the repo but the API server never launches a
+# browser (the scraping runs on Azure Functions). Skip the browser download so
+# the free-tier Render build finishes quickly instead of timing out (~hundreds
+# of MB of Chromium).
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
 COPY package*.json ./
 RUN npm ci
 
