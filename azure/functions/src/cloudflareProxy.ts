@@ -53,14 +53,101 @@ const BASE_BACKOFF_MS = 1500;
  * (it might work for a different page/network), but a path with a bad streak
  * of failures is deprioritised.
  *
- * This is in-process state (per function instance) — good enough for the
- * steady-state within a single run and across a warm instance.
+ * PERSISTED IN REDIS so the memory survives Azure cold starts. Without this,
+ * every cold start (common after ~5-20 min idle on Consumption) resets the
+ * scores and the FIRST search after idle re-tries a known-dead path (e.g.
+ * residential timing out at 20s) — the "Contacting the job boards…" wait.
+ * The state is global (not per-user): proxy-path health is account-agnostic.
  */
 type FetchPath = "residential" | "cloudflare" | "scraperapi" | "public";
+
+const CB_REDIS_KEY = "proxy:circuit-breaker:v1";
+
+// In-memory cache of the persisted state (loaded lazily, written on change).
 const pathScores: Record<string, Partial<Record<FetchPath, number>>> = {};
 const pathFailures: Record<string, Partial<Record<FetchPath, number>>> = {};
+let cbLoaded = false;
 
-function bumpPath(board: string, path: FetchPath, ok: boolean): void {
+/** Tiny Upstash REST client for the circuit-breaker state (same as redisState). */
+async function cbRedisGet(): Promise<string | null> {
+  const url = process.env.KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return null;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["GET", CB_REDIS_KEY]),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { result?: string | null };
+    return data.result ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function cbRedisSet(): Promise<void> {
+  const url = process.env.KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return;
+  try {
+    // TTL 7 days — long enough to remember path health across cold starts,
+    // short enough that a genuinely-changed network recovers eventually.
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify([
+        "SETEX",
+        CB_REDIS_KEY,
+        String(60 * 60 * 24 * 7),
+        JSON.stringify({ pathScores, pathFailures }),
+      ]),
+    });
+    void res;
+  } catch {
+    // non-fatal — best-effort persistence
+  }
+}
+
+/** Load persisted circuit-breaker state from Redis (once per cold start). */
+async function loadCircuitBreaker(): Promise<void> {
+  if (cbLoaded) return;
+  cbLoaded = true; // prevent repeated loads
+  const raw = await cbRedisGet();
+  if (!raw) return;
+  try {
+    const parsed = JSON.parse(raw) as {
+      pathScores?: typeof pathScores;
+      pathFailures?: typeof pathFailures;
+    };
+    if (parsed.pathScores) {
+      for (const [k, v] of Object.entries(parsed.pathScores)) {
+        pathScores[k] = { ...(pathScores[k] ?? {}), ...v };
+      }
+    }
+    if (parsed.pathFailures) {
+      for (const [k, v] of Object.entries(parsed.pathFailures)) {
+        pathFailures[k] = { ...(pathFailures[k] ?? {}), ...v };
+      }
+    }
+  } catch {
+    // corrupted state → ignore and start fresh
+  }
+}
+
+async function bumpPath(
+  board: string,
+  path: FetchPath,
+  ok: boolean,
+): Promise<void> {
+  await loadCircuitBreaker();
   if (!pathScores[board]) pathScores[board] = {};
   if (!pathFailures[board]) pathFailures[board] = {};
   if (ok) {
@@ -70,6 +157,8 @@ function bumpPath(board: string, path: FetchPath, ok: boolean): void {
   } else {
     pathFailures[board]![path] = (pathFailures[board]![path] ?? 0) + 1;
   }
+  // Persist on every bump (cheap; keeps cold starts warm).
+  await cbRedisSet().catch(() => {});
 }
 
 /** Order paths best-first using success counts, honouring a hard skip list. */
@@ -109,6 +198,10 @@ export async function fetchBoardPage(opts: {
 }): Promise<ProxyResult> {
   const { board, keyword, page, countryCode, log = console.log } = opts;
 
+  // Load the persisted circuit-breaker state so `orderPaths` sees which paths
+  // are known-good/known-dead from previous runs (survives cold starts).
+  await loadCircuitBreaker();
+
   // ── Boards that block datacenter IPs (jobsdb returns 403 to Cloudflare) ──
   // Try the DataImpulse residential proxy FIRST — residential IPs pass
   // anti-bot, whereas the Cloudflare worker's datacenter egress gets 403'd.
@@ -142,7 +235,7 @@ export async function fetchBoardPage(opts: {
           });
           if (direct.ok && direct.html) {
             residentialOk = true;
-            bumpPath(board, "residential", true);
+            await bumpPath(board, "residential", true);
             log(
               `[proxy] ${board} p${page} OK via residential (datacenter-blocked board)`,
             );
@@ -158,7 +251,7 @@ export async function fetchBoardPage(opts: {
             await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
           }
         }
-        if (!residentialOk) bumpPath(board, "residential", false);
+        if (!residentialOk) await bumpPath(board, "residential", false);
       }
 
       if (path === "scraperapi") {
@@ -183,10 +276,10 @@ export async function fetchBoardPage(opts: {
             log,
           });
           if (sa.ok && sa.html) {
-            bumpPath(board, "scraperapi", true);
+            await bumpPath(board, "scraperapi", true);
             return { ok: true, html: sa.html };
           }
-          bumpPath(board, "scraperapi", false);
+          await bumpPath(board, "scraperapi", false);
           lastErr = {
             error: sa.error ?? "upstream",
             detail: sa.detail,
@@ -216,14 +309,14 @@ export async function fetchBoardPage(opts: {
             clearTimeout(t);
             const body = (await res.json()) as ProxyResult;
             if (body.ok) {
-              bumpPath(board, "cloudflare", true);
+              await bumpPath(board, "cloudflare", true);
               return body;
             }
-            bumpPath(board, "cloudflare", false);
+            await bumpPath(board, "cloudflare", false);
             lastErr = { error: body.error, detail: body.detail };
             log(`[proxy] ${board} Cloudflare worker: ${body.error}`);
           } catch (err) {
-            bumpPath(board, "cloudflare", false);
+            await bumpPath(board, "cloudflare", false);
             log(`[proxy] ${board} Cloudflare worker fetch error: ${err}`);
           }
         }
@@ -264,7 +357,7 @@ export async function fetchBoardPage(opts: {
       const body = (await res.json()) as ProxyResult;
 
       if (body.ok) {
-        bumpPath(board, "cloudflare", true);
+        await bumpPath(board, "cloudflare", true);
         return body;
       }
 
@@ -273,7 +366,7 @@ export async function fetchBoardPage(opts: {
       // tried as the final resort, even on a hard block).
       if (body.error === "blocked" || body.error === "challenge") {
         cloudflareFailed = true;
-        bumpPath(board, "cloudflare", false);
+        await bumpPath(board, "cloudflare", false);
         log(
           `[proxy] ${board} got ${body.error} — trying residential + ScraperAPI fallbacks`,
         );
@@ -285,7 +378,7 @@ export async function fetchBoardPage(opts: {
         body.error,
       );
       if (!retryable) {
-        bumpPath(board, "cloudflare", false);
+        await bumpPath(board, "cloudflare", false);
         log(`[proxy] ${board} non-retryable error: ${body.error}`);
         return body;
       }
@@ -308,7 +401,7 @@ export async function fetchBoardPage(opts: {
   }
 
   log(`[proxy] ${board} gave up after ${MAX_ATTEMPTS} attempts`);
-  if (cloudflareFailed) bumpPath(board, "cloudflare", false);
+  if (cloudflareFailed) await bumpPath(board, "cloudflare", false);
 
   // ── Fallback 1: try the DataImpulse residential proxy directly ──
   const direct = await fetchBoardDirect({
@@ -319,10 +412,10 @@ export async function fetchBoardPage(opts: {
     log,
   });
   if (direct.ok && direct.html) {
-    bumpPath(board, "residential", true);
+    await bumpPath(board, "residential", true);
     return { ok: true, html: direct.html };
   }
-  bumpPath(board, "residential", false);
+  await bumpPath(board, "residential", false);
   log(
     `[proxy] ${board} direct fallback also failed: ${direct.error} detail=${direct.detail ?? ""}`,
   );
@@ -342,10 +435,10 @@ export async function fetchBoardPage(opts: {
       log,
     });
     if (sa.ok && sa.html) {
-      bumpPath(board, "scraperapi", true);
+      await bumpPath(board, "scraperapi", true);
       return { ok: true, html: sa.html };
     }
-    bumpPath(board, "scraperapi", false);
+    await bumpPath(board, "scraperapi", false);
     log(
       `[scraperapi] ${board} ScraperAPI also failed: ${sa.error}${sa.detail ? ` (${sa.detail})` : ""}`,
     );
