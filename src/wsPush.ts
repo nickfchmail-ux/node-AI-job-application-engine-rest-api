@@ -336,52 +336,14 @@ async function collectEvaluationBatches(
   userId: string | null,
   rows: Record<string, unknown>[],
 ): Promise<EvaluationBatchState[]> {
-  if (!userId) return [];
-  const supabase = getSupabaseClient();
-  const { data: jobs, error: jobsErr } = await supabase
-    .from("jobs")
-    .select("search_key, fit, fit_score, updated_at")
-    .eq("user_id", userId)
-    .in("status", ["completed", "analysed"]);
-  if (jobsErr) console.warn(`[ws] jobs failed: ${jobsErr.message}`);
-
-  const jobsForUser = (jobs ?? []) as {
-    search_key: string | null;
-    fit: boolean | null;
-    fit_score: number | null;
-    updated_at: string | null;
-  }[];
-
+  // fit/not-fit come from the batch's OWN atomic counters (`fit_jobs` /
+  // `not_fit_jobs`, bumped by each worker as it scores a job) — NO
+  // jobs-table scan. Deriving them by scanning jobs was fragile: it hit
+  // Supabase's 1,000-row REST limit (a user with 1,043 non-duplicate jobs
+  // silently lost 43 from every count), mis-handled keyword normalization,
+  // and over-counted when a key was matched more than once.
+  void userId;
   return (rows ?? []).map((row) => {
-    const key = String(row.keyword ?? "general")
-      .trim()
-      .toLowerCase();
-    const batchStart = row.created_at
-      ? new Date(row.created_at as string).getTime()
-      : 0;
-
-    // Scope fit/not-fit to THIS batch's own jobs. The batch enqueued only
-    // jobs that were `fit_score IS NULL` at creation, so its scored jobs are
-    // exactly those with `updated_at >= batchStart`. Counting account-wide
-    // (every scored job of the key, from any batch) over-counts when the key
-    // was matched before — e.g. a batch of 42 showed 35 fit/not-fit because
-    // it also swept in jobs from an earlier match of the same key.
-    let fit = 0;
-    let notFit = 0;
-    for (const j of jobsForUser) {
-      if (
-        String(j.search_key ?? "general")
-          .trim()
-          .toLowerCase() !== key
-      )
-        continue;
-      if (j.fit_score === null) continue;
-      if (!(j.updated_at && new Date(j.updated_at).getTime() >= batchStart))
-        continue;
-      if (j.fit === true) fit++;
-      else if (j.fit === false) notFit++;
-    }
-
     // `remaining` from the batch's OWN atomically-updated counters — NOT a
     // job scan. Workers bump processed/failed as each job finishes, so
     // total - processed - failed is what's still in flight. A job-scan
@@ -401,8 +363,8 @@ async function collectEvaluationBatches(
       totalJobs: Number(row.total_jobs ?? 0),
       processedJobs: Number(row.processed_jobs ?? 0),
       failedJobs: Number(row.failed_jobs ?? 0),
-      fitJobs: fit,
-      notFitJobs: notFit,
+      fitJobs: Number(row.fit_jobs ?? 0),
+      notFitJobs: Number(row.not_fit_jobs ?? 0),
       remainingJobs: remaining,
       lastError: row.last_error == null ? null : String(row.last_error),
       updatedAt: row.updated_at ? String(row.updated_at) : undefined,
