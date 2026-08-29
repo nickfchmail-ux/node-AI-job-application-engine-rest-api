@@ -79,7 +79,7 @@ router.post("/refresh", async (req: Request, res: Response) => {
       const status = (error as { status?: number }).status;
       if (
         status === 401 ||
-        /invalid|expired|not found|invalid JWT|token has expired/i.test(
+        /invalid|not valid|expired|not found|invalid JWT|token has expired/i.test(
           error?.message ?? "",
         )
       ) {
@@ -99,9 +99,21 @@ router.post("/refresh", async (req: Request, res: Response) => {
       user: { id: data.user!.id, email: data.user!.email },
     });
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Supabase can THROW for a genuinely invalid refresh token (rather than
+    // returning { error }). If the message clearly indicates the token is bad,
+    // return 401 so the client logs out; otherwise treat as transient (503).
+    if (
+      /invalid|not valid|expired|not found|invalid JWT|token has expired|refresh token/i.test(
+        msg,
+      )
+    ) {
+      res.status(401).json({ error: msg });
+      return;
+    }
     // Network / upstream error — the token may still be valid. 503, not 401,
     // so the client keeps the session and retries.
-    res.status(503).json({ error: (err as Error).message });
+    res.status(503).json({ error: msg });
   }
 });
 
