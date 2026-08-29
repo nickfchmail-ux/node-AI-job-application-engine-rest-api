@@ -356,7 +356,16 @@ async function collectEvaluationBatches(
     const key = String(row.keyword ?? "general")
       .trim()
       .toLowerCase();
+    const batchStart = row.created_at
+      ? new Date(row.created_at as string).getTime()
+      : 0;
 
+    // Scope fit/not-fit to THIS batch's own jobs. The batch enqueued only
+    // jobs that were `fit_score IS NULL` at creation, so its scored jobs are
+    // exactly those with `updated_at >= batchStart`. Counting account-wide
+    // (every scored job of the key, from any batch) over-counts when the key
+    // was matched before — e.g. a batch of 42 showed 35 fit/not-fit because
+    // it also swept in jobs from an earlier match of the same key.
     let fit = 0;
     let notFit = 0;
     for (const j of jobsForUser) {
@@ -366,22 +375,19 @@ async function collectEvaluationBatches(
           .toLowerCase() !== key
       )
         continue;
-      // Count EVERY scored job for this key toward fit/not-fit — from ANY
-      // previous batch of this key. The old `updated_at >= batchStart`
-      // filter dropped previously-scored jobs when a key was re-matched, so
-      // a key with 39 scored jobs showed "0 fit / 0 not fit" the moment a
-      // new batch started.
       if (j.fit_score === null) continue;
+      if (!(j.updated_at && new Date(j.updated_at).getTime() >= batchStart))
+        continue;
       if (j.fit === true) fit++;
       else if (j.fit === false) notFit++;
     }
 
-    // `remaining` comes from the batch's OWN atomically-updated counters —
-    // NOT a job scan. The workers bump processed/failed as each job
-    // finishes, so total - processed - failed is exactly what's still in
-    // flight. A job-scan "unscored" count would count FAILED jobs as
-    // "remaining" forever (they never get scored), keeping the batch's
-    // `remaining_jobs` stuck > 0 and the frontend's done-guard never true.
+    // `remaining` from the batch's OWN atomically-updated counters — NOT a
+    // job scan. Workers bump processed/failed as each job finishes, so
+    // total - processed - failed is what's still in flight. A job-scan
+    // "unscored" count would count FAILED jobs as "remaining" forever (they
+    // never get scored), keeping `remaining_jobs` > 0 and the frontend's
+    // done-guard never true.
     const total = Number(row.total_jobs ?? 0);
     const processed = Number(row.processed_jobs ?? 0);
     const failed = Number(row.failed_jobs ?? 0);
