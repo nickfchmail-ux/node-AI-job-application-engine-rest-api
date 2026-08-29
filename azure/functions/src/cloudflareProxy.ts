@@ -8,9 +8,9 @@
 //  proxy (see directProxy.ts).
 // ============================================================
 
-import { fetchBoardDirect, fetchDetailDirect, DirectProxyResult } from "./directProxy";
-import { fetchViaScraperApi, isScraperApiConfigured } from "./scraperApi";
 import { getBoardPattern } from "./boardRegistry";
+import { fetchBoardDirect, fetchDetailDirect } from "./directProxy";
+import { fetchViaScraperApi, isScraperApiConfigured } from "./scraperApi";
 
 export interface ProxySuccess {
   ok: true;
@@ -149,8 +149,7 @@ export async function fetchBoardPage(opts: {
             return { ok: true, html: direct.html };
           }
           lastErr = direct;
-          const retry =
-            direct.error && retryable.includes(direct.error);
+          const retry = direct.error && retryable.includes(direct.error);
           log(
             `[proxy] ${board} residential attempt ${attempt + 1}/${RESIDENTIAL_MAX_ATTEMPTS} got ${direct.error}${direct.detail ? ` ${direct.detail}` : ""}${retry ? " — retrying" : ""}`,
           );
@@ -164,15 +163,25 @@ export async function fetchBoardPage(opts: {
 
       if (path === "scraperapi") {
         // ScraperAPI (rotating residential IPs) is the reliable paid answer
-        // for datacenter-blocked boards. Only Indeed previously used it, but
-        // JobsDB + CTgoodjobs are the user's most-searched boards and have NO
-        // free path when residential + Cloudflare both fail — so include them
-        // here too. OfferToday/LinkedIn resolve via public APIs (never here).
-        const scraperBoards = new Set(["indeed", "jobsdb", "ctgoodjobs"]);
+        // for datacenter-blocked boards. IMPORTANT COST CONSTRAINT: only use
+        // it for Indeed — NEVER JobsDB/CTgoodjobs (the user's most-searched
+        // boards) because every ScraperAPI call costs money. Those boards must
+        // rely on residential (DataImpulse) + Cloudflare only.
+        const scraperBoards = new Set(["indeed"]);
         const target = getBoardSearchUrl(board, keyword, page, countryCode);
-        if (scraperBoards.has(board) && target && (await isScraperApiConfigured())) {
-          log(`[scraperapi] ${board} p${page} — trying ScraperAPI (rotating IPs)...`);
-          const sa = await fetchViaScraperApi({ url: target, countryCode, log });
+        if (
+          scraperBoards.has(board) &&
+          target &&
+          (await isScraperApiConfigured())
+        ) {
+          log(
+            `[scraperapi] ${board} p${page} — trying ScraperAPI (rotating IPs)...`,
+          );
+          const sa = await fetchViaScraperApi({
+            url: target,
+            countryCode,
+            log,
+          });
           if (sa.ok && sa.html) {
             bumpPath(board, "scraperapi", true);
             return { ok: true, html: sa.html };
@@ -319,9 +328,11 @@ export async function fetchBoardPage(opts: {
   );
 
   // ── Fallback 2 (FINAL): ScraperAPI — last resort for anti-bot-hard boards ──
-  // ScraperAPI rotating IPs are the reliable last answer for the datacenter-
-  // blocked boards (Indeed + the user's most-searched JobsDB/CTgoodjobs).
-  const scraperBoards = new Set(["indeed", "jobsdb", "ctgoodjobs"]);
+  // ScraperAPI rotating IPs are the reliable last answer for Indeed.
+  // IMPORTANT COST CONSTRAINT: NEVER use ScraperAPI for JobsDB/CTgoodjobs
+  // (the user's most-searched boards) — every call costs money. They must
+  // rely on residential (DataImpulse) + Cloudflare only.
+  const scraperBoards = new Set(["indeed"]);
   const target = getBoardSearchUrl(board, keyword, page, countryCode);
   if (scraperBoards.has(board) && target && (await isScraperApiConfigured())) {
     log(`[scraperapi] ${board} — trying ScraperAPI as final fallback...`);
