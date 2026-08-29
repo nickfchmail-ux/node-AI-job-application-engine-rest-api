@@ -298,6 +298,27 @@ export function boardsFrom(
     b.jobsFailed = Number(row.jobs_failed ?? 0);
     b.lastError = row.last_error == null ? null : String(row.last_error);
     b.displayName = BOARD_DISPLAY[key] ?? key;
+
+    // ── Supabase fallback for live counters ──────────────────────────
+    // The Redis (Upstash) live counters can be unavailable — e.g. the free
+    // tier hits its request limit and `incrementCounters` silently no-ops
+    // (best-effort), leaving scraped/duplicate/processing at 0 forever even
+    // though the scraper found jobs. `run_boards` holds the authoritative
+    // per-board progress, so when Redis hasn't reported any scraped count for
+    // this board, fall back to jobs_found (= found) / jobs_processed (=
+    // done) so the table shows REAL numbers instead of zeros.
+    if (b.scraped === 0 && b.jobsFound > 0) {
+      b.scraped = b.jobsFound;
+      // unique = jobs not already known; run_boards doesn't split dup vs new,
+      // so show jobs_found as new (the board's found count is what was new
+      // this run — duplicates are already in the user's list and not counted
+      // into jobs_found by the scraper for fresh results).
+      b.unique = Math.max(0, b.jobsFound);
+      b.duplicate = 0;
+    }
+    if (b.processing === 0 && b.jobsProcessed > 0 && b.stage === "done") {
+      b.processing = 0; // done boards have nothing in flight
+    }
   }
 
   // Ensure unique = scraped - duplicate per board.
