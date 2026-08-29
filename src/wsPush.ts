@@ -356,13 +356,9 @@ async function collectEvaluationBatches(
     const key = String(row.keyword ?? "general")
       .trim()
       .toLowerCase();
-    const batchStart = row.created_at
-      ? new Date(row.created_at as string).getTime()
-      : 0;
 
     let fit = 0;
     let notFit = 0;
-    let remaining = 0;
     for (const j of jobsForUser) {
       if (
         String(j.search_key ?? "general")
@@ -370,16 +366,26 @@ async function collectEvaluationBatches(
           .toLowerCase() !== key
       )
         continue;
-      // A job is part of THIS batch if it was scored at/after the batch was
-      // created, OR it is still unscored (belongs to the in-progress batch).
-      const touched =
-        j.fit_score === null ||
-        (j.updated_at && new Date(j.updated_at).getTime() >= batchStart);
-      if (!touched) continue;
-      if (j.fit_score === null) remaining++;
-      else if (j.fit === true) fit++;
+      // Count EVERY scored job for this key toward fit/not-fit — from ANY
+      // previous batch of this key. The old `updated_at >= batchStart`
+      // filter dropped previously-scored jobs when a key was re-matched, so
+      // a key with 39 scored jobs showed "0 fit / 0 not fit" the moment a
+      // new batch started.
+      if (j.fit_score === null) continue;
+      if (j.fit === true) fit++;
       else if (j.fit === false) notFit++;
     }
+
+    // `remaining` comes from the batch's OWN atomically-updated counters —
+    // NOT a job scan. The workers bump processed/failed as each job
+    // finishes, so total - processed - failed is exactly what's still in
+    // flight. A job-scan "unscored" count would count FAILED jobs as
+    // "remaining" forever (they never get scored), keeping the batch's
+    // `remaining_jobs` stuck > 0 and the frontend's done-guard never true.
+    const total = Number(row.total_jobs ?? 0);
+    const processed = Number(row.processed_jobs ?? 0);
+    const failed = Number(row.failed_jobs ?? 0);
+    const remaining = Math.max(0, total - processed - failed);
 
     return {
       id: String(row.id),
