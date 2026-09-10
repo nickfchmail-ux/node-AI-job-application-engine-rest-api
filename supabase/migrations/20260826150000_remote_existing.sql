@@ -1,0 +1,1 @@
+-- Pre-existing remote migration 20260826150000. Applied from the next-react repo; kept here as a local placeholder so the Supabase CLI can reconcile migration history. Do not run.

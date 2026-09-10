@@ -41,5 +41,9 @@ supabase_insert.json
 poll.js
 azure/functions/jobsdb_direct.html
 
+# Local verification harnesses (migration 0017 + on-job-changed integration)
+.tmp-verify/
+deno.lock
+
 # VS Code local editor config
 .vscode/
