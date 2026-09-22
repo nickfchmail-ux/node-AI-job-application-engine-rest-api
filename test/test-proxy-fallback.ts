@@ -2,11 +2,17 @@
 import { extractListings } from "../azure/functions/src/boardParsers";
 import { fetchBoardPage } from "../azure/functions/src/cloudflareProxy";
 
+// ⚠️ The proxy credential is read from the ENVIRONMENT and must never be
+// hardcoded here. A previous revision carried it in plaintext, so that
+// credential is considered compromised — rotate it in the DataImpulse
+// dashboard before relying on it.
 async function main() {
   process.env.CLOUDFLARE_PROXY_URL =
     "https://jobboard-proxy.nickfchmail.workers.dev";
-  process.env.DATA_IMPULSE_PROXY_URL =
-    "http://1dadd5807dd571717a52__cr.hk:1dd6773e6f2686b6@gw.dataimpulse.com:823";
+  if (!process.env.DATA_IMPULSE_PROXY_URL) {
+    console.error("DATA_IMPULSE_PROXY_URL is not set — aborting.");
+    process.exit(1);
+  }
 
   console.log("Testing JobsDB via Cloudflare → DataImpulse fallback...");
   const r = await fetchBoardPage({

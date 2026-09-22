@@ -2,9 +2,17 @@
 import * as fs from "fs";
 import { fetchBoardDirect } from "../azure/functions/src/directProxy";
 
+// ⚠️ The proxy credential is read from the ENVIRONMENT and must never be
+// hardcoded here. A previous revision carried it in plaintext, so that
+// credential is considered compromised — rotate it in the DataImpulse
+// dashboard before relying on it.
+// Note: the DataImpulse residential proxy was returning 429 + a challenge page
+// and is treated as dead; the live path is ScraperAPI + the Cloudflare worker.
 async function main() {
-  process.env.DATA_IMPULSE_PROXY_URL =
-    "http://1dadd5807dd571717a52__cr.hk:1dd6773e6f2686b6@gw.dataimpulse.com:823";
+  if (!process.env.DATA_IMPULSE_PROXY_URL) {
+    console.error("DATA_IMPULSE_PROXY_URL is not set — aborting.");
+    process.exit(1);
+  }
   const r = await fetchBoardDirect({
     board: "jobsdb",
     keyword: "web developer",
